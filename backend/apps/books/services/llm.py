@@ -897,8 +897,8 @@ class LLMService:
         if off_topic_intent:
             return {
                 "assistant_reply": (
-                    "I’m the Book Studio assistant, so I can only help with your book brief here. "
-                    "If you want, tell me which form field you want to update (title, audience, tone, chapter length, etc.)."
+                    "I can only help fill in your book brief here. "
+                    "To continue, tell me about your book - what it is about, who it is for, or what tone it should have."
                 ),
                 "field_updates": updates,
                 "next_field": "",
@@ -1035,8 +1035,8 @@ class LLMService:
         if off_topic_intent:
             return {
                 "assistant_reply": (
-                    "I’m the Book Studio assistant, so I can help with your Concept Studio form fields only. "
-                    "Tell me which field you want to update, and I’ll help."
+                    "I can only help fill in your book brief here. "
+                    "To continue, tell me about your book - what it is about, who it is for, or what tone it should have."
                 ),
                 "field_updates": {},
                 "next_field": "",
@@ -1843,59 +1843,26 @@ def _is_off_topic_or_out_of_scope(message: str) -> bool:
     if not text:
         return False
 
-    # Stay in-scope for book-brief and form-field terms.
-    in_scope_tokens = (
-        "book",
-        "title",
-        "subtitle",
-        "genre",
-        "audience",
-        "reader",
-        "purpose",
-        "tone",
-        "style",
-        "point of view",
-        "vocabulary",
-        "chapter",
-        "word count",
-        "publishing",
-        "front matter",
-        "back matter",
-        "cta",
-        "call to action",
-        "reference books",
-        "style reference",
-        "content boundaries",
-        "rich elements",
-        "finalize",
-        "finalise",
-        "brief",
+    # Topic-agnostic guard: only block requests that try to use the
+    # profile assistant as a general-purpose chatbot/tool, not messages
+    # about the book's subject matter.
+    truly_offtopic_signals = (
+        "write me a ",
+        "write a script",
+        "write a python code",
+        "write python code",
+        "python script",
+        "solve this",
+        "calculate ",
+        "translate this",
+        "tell me a joke",
+        "what is the weather",
+        "what s the weather",
+        "weather today",
+        "search the web",
+        "browse ",
     )
-    if any(token in text for token in in_scope_tokens):
-        return False
-
-    code_tokens = (
-        "python code",
-        "write code",
-        "code to ",
-        "print helo",
-        "print hello",
-        "javascript",
-        "sql query",
-        "html code",
-    )
-    fact_tokens = (
-        "pm of",
-        "prime minister",
-        "president of",
-        "capital of",
-        "who is ",
-        "weather ",
-        "news ",
-    )
-    if any(token in text for token in code_tokens):
-        return True
-    if any(token in text for token in fact_tokens):
+    if any(signal in text for signal in truly_offtopic_signals):
         return True
 
     return False

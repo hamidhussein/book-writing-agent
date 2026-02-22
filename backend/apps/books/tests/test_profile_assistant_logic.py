@@ -4,6 +4,7 @@ from django.test import SimpleTestCase
 
 from apps.books.services.llm import (
     LLMService,
+    _is_off_topic_or_out_of_scope,
     _missing_required_profile,
     _normalize_profile_value,
 )
@@ -411,8 +412,38 @@ class ProfileAssistantLogicTests(SimpleTestCase):
 
         self.assertFalse(normalized["is_finalized"])
         self.assertEqual(normalized["next_field"], "")
-        self.assertIn("book studio assistant", normalized["assistant_reply"].lower())
+        self.assertIn("fill in your book brief", normalized["assistant_reply"].lower())
         self.assertIn("book brief", normalized["assistant_reply"].lower())
+
+    def test_book_subject_matter_is_not_treated_as_off_topic(self):
+        current_profile = _base_profile()
+        payload = {
+            "assistant_reply": "What audience is this for?",
+            "field_updates": {},
+            "next_field": "audience",
+            "is_finalized": False,
+            "missing_required": ["title"],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="I want to write about prime minister elections",
+            conversation=[],
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertNotEqual(normalized["next_field"], "")
+        self.assertNotIn("fill in your book brief", normalized["assistant_reply"].lower())
+
+    def test_off_topic_guard_is_topic_agnostic_but_blocks_general_chatbot_requests(self):
+        self.assertFalse(_is_off_topic_or_out_of_scope("book about prime minister elections"))
+        self.assertFalse(_is_off_topic_or_out_of_scope("who is my ideal reader for this book"))
+        self.assertFalse(_is_off_topic_or_out_of_scope("fun and educational tone"))
+
+        self.assertTrue(_is_off_topic_or_out_of_scope("write me a python script"))
+        self.assertTrue(_is_off_topic_or_out_of_scope("what is the weather today"))
+        self.assertTrue(_is_off_topic_or_out_of_scope("tell me a joke"))
 
     def test_pause_intent_returns_resume_later_reply(self):
         current_profile = _base_profile()
