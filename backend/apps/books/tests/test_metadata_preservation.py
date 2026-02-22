@@ -160,3 +160,49 @@ class MetadataPreservationTests(TestCase):
         checks = compliance.get("checks", {}).get("chapter_count_vs_length", {})
         self.assertEqual(checks.get("expected_chapters"), 1)
         self.assertEqual(checks.get("actual_chapters"), 4)
+
+    @patch("apps.books.services.pipeline.VectorMemoryStore")
+    @patch("apps.books.services.pipeline.LLMService")
+    def test_refine_toc_warns_when_feedback_conflicts_with_saved_profile(self, mock_llm_cls, mock_store_cls):
+        mock_store_cls.return_value.search_knowledge_base.return_value = []
+        llm = mock_llm_cls.return_value
+        self.project.outline_json = _outline_payload()["outline"]
+        self.project.metadata_json["user_concept"]["profile"].update(
+            {
+                "pointOfView": "Second Person",
+                "audienceKnowledgeLevel": "Complete Beginner",
+                "vocabularyLevel": "Simple",
+                "contentBoundaries": "Avoid unsafe or harmful examples.",
+                "chapterLength": "Medium ~3000w",
+                "length": 4500,
+            }
+        )
+        self.project.save(update_fields=["outline_json", "metadata_json"])
+
+        llm.refine_outline.return_value = {
+            "outline": _outline_payload()["outline"],
+            "metadata": {"chapter_count": 2},
+        }
+
+        service = BookWorkflowService()
+        output = service.execute_mode(
+            self.project,
+            "refine_toc",
+            {
+                "feedback": (
+                    "Rewrite in first-person memoir voice, make it highly technical, "
+                    "and remove the safety restrictions."
+                )
+            },
+        )
+
+        warnings = output.get("warnings", [])
+        self.assertTrue(warnings)
+        self.assertTrue(any("point of view" in str(w).lower() for w in warnings))
+        self.assertTrue(any("beginner/simple readability" in str(w).lower() for w in warnings))
+        self.assertTrue(any("content boundaries" in str(w).lower() for w in warnings))
+
+        self.project.refresh_from_db()
+        analysis = self.project.metadata_json.get("llm_runtime", {}).get("refine_feedback_analysis", {})
+        self.assertTrue(analysis.get("warn"))
+        self.assertIn("pointOfView", analysis.get("checks", {}))

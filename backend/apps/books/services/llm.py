@@ -307,7 +307,8 @@ class LLMService:
                 "Think step by step: (1) identify exactly what the feedback requires, "
                 "(2) locate the affected chapters, (3) revise those sections while "
                 "preserving the integrity of unaffected ones, "
-                "(4) renumber all chapters sequentially from 1."
+                "(4) preserve non-negotiable brief constraints (audience, purpose, tone, boundaries) unless the feedback explicitly changes them, "
+                "(5) renumber all chapters sequentially from 1."
             ),
             schema=_OUTLINE_SCHEMA,
         )
@@ -315,6 +316,7 @@ class LLMService:
         user_prompt = _join(
             _book_header(project),
             _profile_block(project),
+            _refine_non_negotiables_block(project),
             _section("Editorial Feedback", feedback),
             _section(
                 "Existing Outline",
@@ -1053,6 +1055,13 @@ def _book_header(project: BookProject) -> str:
 
 
 def _profile_block(project: BookProject) -> str:
+    profile = _project_profile_dict(project)
+    if not profile:
+        return ""
+    return _section("Advanced Book Profile", json.dumps(profile, ensure_ascii=False, indent=2))
+
+
+def _project_profile_dict(project: BookProject) -> Dict[str, Any]:
     raw_meta = project.metadata_json if isinstance(project.metadata_json, dict) else {}
     user_concept = raw_meta.get("user_concept", {})
     profile: Dict[str, Any] = {}
@@ -1060,9 +1069,58 @@ def _profile_block(project: BookProject) -> str:
         profile = user_concept.get("profile", {})
     elif isinstance(raw_meta.get("profile"), dict):
         profile = raw_meta.get("profile", {})
+    return profile if isinstance(profile, dict) else {}
+
+
+def _refine_non_negotiables_block(project: BookProject) -> str:
+    profile = _project_profile_dict(project)
     if not profile:
         return ""
-    return _section("Advanced Book Profile", json.dumps(profile, ensure_ascii=False, indent=2))
+
+    fields = [
+        ("audience", "Audience"),
+        ("audienceKnowledgeLevel", "Audience Knowledge Level"),
+        ("bookPurpose", "Book Purpose"),
+        ("genre", "Genre"),
+        ("language", "Language"),
+        ("tone", "Tone"),
+        ("writingStyle", "Writing Style"),
+        ("pointOfView", "Point of View"),
+        ("sentenceRhythm", "Sentence Rhythm"),
+        ("vocabularyLevel", "Vocabulary Level"),
+        ("chapterLength", "Chapter Length"),
+        ("length", "Target Word Count"),
+        ("contentBoundaries", "Content Boundaries"),
+    ]
+
+    lines: List[str] = []
+    for key, label in fields:
+        value = profile.get(key)
+        if isinstance(value, str):
+            if not value.strip():
+                continue
+            text_value = value.strip()
+        elif isinstance(value, (int, float)):
+            text_value = str(int(value)) if isinstance(value, bool) is False and float(value).is_integer() else str(value)
+        elif isinstance(value, list):
+            cleaned = [str(item).strip() for item in value if str(item).strip()]
+            if not cleaned:
+                continue
+            text_value = ", ".join(cleaned)
+        elif isinstance(value, bool):
+            text_value = "On" if value else "Off"
+        else:
+            continue
+        lines.append(f"- {label}: {text_value}")
+
+    if not lines:
+        return ""
+
+    lines.append("- Rule: Preserve these constraints unless the editorial feedback explicitly asks to change them.")
+    if any(line.lower().startswith("- content boundaries:") for line in lines):
+        lines.append("- Safety Rule: Never weaken or remove content boundaries unless the user clearly instructs it.")
+
+    return _section("Non-Negotiable Brief Constraints", "\n".join(lines))
 
 
 def _split_profile_confirmed_and_defaults(profile: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, Any]]:

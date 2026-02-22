@@ -78,6 +78,7 @@ class BookWorkflowService:
         feedback = str(inputs.get("feedback", "")).strip()
         if not feedback:
             raise ValueError("feedback is required for refine_toc mode")
+        refine_feedback_analysis = self._analyze_refine_feedback_conflicts(project, feedback)
         existing_outline = project.outline_json or {}
         kb_context = self.vector_store.search_knowledge_base(
             project_id=str(project.id),
@@ -95,7 +96,10 @@ class BookWorkflowService:
         outline_profile_compliance = self._outline_profile_compliance(project, outline)
         llm_runtime_meta = self._merge_dicts(
             payload.get("metadata", {}),
-            {"profile_compliance": outline_profile_compliance},
+            {
+                "profile_compliance": outline_profile_compliance,
+                "refine_feedback_analysis": refine_feedback_analysis,
+            },
         )
 
         project.outline_json = outline
@@ -106,7 +110,15 @@ class BookWorkflowService:
 
         self._sync_chapters_from_outline(project, outline)
 
-        warnings = list(outline_profile_compliance.get("issues", [])) if outline_profile_compliance.get("fail") else []
+        warnings: List[str] = []
+        if bool(refine_feedback_analysis.get("warn")):
+            warnings.extend([str(issue) for issue in refine_feedback_analysis.get("issues", []) if str(issue).strip()])
+        if outline_profile_compliance.get("fail"):
+            warnings.extend([str(issue) for issue in outline_profile_compliance.get("issues", []) if str(issue).strip()])
+        deduped_warnings: List[str] = []
+        for warning in warnings:
+            if warning not in deduped_warnings:
+                deduped_warnings.append(warning)
 
         response = {
             "status": "success",
@@ -122,8 +134,8 @@ class BookWorkflowService:
                 ],
             ),
         }
-        if warnings:
-            response["warnings"] = warnings
+        if deduped_warnings:
+            response["warnings"] = deduped_warnings
         return response
 
     def _run_profile_assistant(self, project: BookProject, inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -602,6 +614,84 @@ class BookWorkflowService:
 
         return {
             "fail": bool(issues),
+            "issues": issues,
+            "checks": checks,
+        }
+
+    def _analyze_refine_feedback_conflicts(self, project: BookProject, feedback: str) -> Dict[str, Any]:
+        profile = self._project_profile(project)
+        text = str(feedback or "").strip()
+        normalized = text.lower()
+        issues: List[str] = []
+        checks: Dict[str, Any] = {}
+
+        point_of_view = str(profile.get("pointOfView", "")).strip()
+        pov_lower = point_of_view.lower()
+        if point_of_view:
+            requested_pov: str | None = None
+            if re.search(r"\b(first[\s-]?person|memoir|i perspective)\b", normalized):
+                requested_pov = "First Person"
+            elif re.search(r"\b(second[\s-]?person|you perspective)\b", normalized):
+                requested_pov = "Second Person"
+            elif re.search(r"\b(third[\s-]?person)\b", normalized):
+                requested_pov = "Third Person"
+            if requested_pov:
+                checks["pointOfView"] = {"profile": point_of_view, "feedback_request": requested_pov}
+                if (
+                    ("first" in pov_lower and requested_pov != "First Person")
+                    or ("second" in pov_lower and requested_pov != "Second Person")
+                    or ("third" in pov_lower and requested_pov != "Third Person")
+                ):
+                    issues.append(
+                        f"Refine feedback may conflict with saved point of view ({point_of_view}) by requesting {requested_pov.lower()}."
+                    )
+
+        audience_level = str(profile.get("audienceKnowledgeLevel", "")).strip()
+        vocabulary_level = str(profile.get("vocabularyLevel", "")).strip()
+        beginner_target = "beginner" in audience_level.lower() or vocabulary_level.lower() == "simple"
+        if beginner_target:
+            if re.search(r"\b(expert|advanced|highly technical|assume prior knowledge|graduate level)\b", normalized):
+                checks["readability"] = {
+                    "profile_audience_level": audience_level,
+                    "profile_vocabulary_level": vocabulary_level,
+                    "feedback": "more advanced/technical",
+                }
+                issues.append(
+                    "Refine feedback may conflict with the beginner/simple readability target by asking for advanced technical depth."
+                )
+
+        tone = str(profile.get("tone", "")).strip()
+        tone_lower = tone.lower()
+        if tone:
+            requested_tone: str | None = None
+            if re.search(r"\b(formal|academic)\b", normalized):
+                requested_tone = "Formal/Academic"
+            elif re.search(r"\b(conversational|casual|friendly)\b", normalized):
+                requested_tone = "Conversational"
+            elif re.search(r"\b(humorous|funny|playful)\b", normalized):
+                requested_tone = "Humorous/Playful"
+            if requested_tone:
+                checks["tone"] = {"profile": tone, "feedback_signal": requested_tone}
+                if (
+                    ("formal" in tone_lower or "academic" in tone_lower) and requested_tone in {"Conversational", "Humorous/Playful"}
+                ) or (
+                    ("conversational" in tone_lower or "informative" in tone_lower) and requested_tone == "Formal/Academic"
+                ):
+                    issues.append(f"Refine feedback may conflict with saved tone ({tone}).")
+
+        content_boundaries = str(profile.get("contentBoundaries", "")).strip()
+        if content_boundaries:
+            if re.search(r"\b(ignore|remove|drop|relax|bypass|override)\b.{0,40}\b(boundar|restriction|safety|limit)\b", normalized):
+                checks["contentBoundaries"] = {"profile": content_boundaries[:240], "feedback_signal": "weaken/remove boundaries"}
+                issues.append("Refine feedback appears to weaken saved content boundaries. Review before applying.")
+
+        book_purpose = str(profile.get("bookPurpose", "")).strip()
+        if book_purpose and re.search(r"\b(turn this into|change purpose to|make it a story instead|make it a research report)\b", normalized):
+            checks["bookPurpose"] = {"profile": book_purpose}
+            issues.append(f"Refine feedback may change the saved book purpose ({book_purpose}).")
+
+        return {
+            "warn": bool(issues),
             "issues": issues,
             "checks": checks,
         }
