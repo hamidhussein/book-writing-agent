@@ -34,6 +34,12 @@ interface AgentOutputs {
   };
   outline?: OutlineData;
   chapter?: { number: number; title: string; content: string; summary?: string };
+  metadata?: Record<string, unknown>;
+  next_steps?: string[];
+  timings_ms?: {
+    total_ms?: number;
+    nodes?: Record<string, number>;
+  };
   pdf_base64?: string;
   pdf_filename?: string;
   docx_base64?: string;
@@ -94,6 +100,7 @@ interface BookState {
   outline: OutlineData | null;
   currentChapterId: number | null;
   chaptersContent: Record<number, string>;
+  chapterReviewTelemetry: Record<number, ChapterReviewTelemetry>;
   backendProjectId: string | null;
   backendMetadata: Record<string, unknown>;
   updatedAt: string;
@@ -154,6 +161,24 @@ interface RunProgressSnapshot {
   revisionCount: number | null;
 }
 
+interface ChapterReviewTelemetry {
+  score: number | null;
+  explicitShouldRevise: boolean;
+  effectiveShouldRevise: boolean;
+  revisionCount: number | null;
+  issues: string[];
+  critique: string;
+  wordCount: number | null;
+  minimumWordCount: number | null;
+  guardrailFail: boolean;
+  profileComplianceFail: boolean;
+  profileComplianceIssues: string[];
+  fallbackStages: string[];
+  usedFallback: boolean;
+  runMs: number | null;
+  generatedAt: string;
+}
+
 type SetBookState = React.Dispatch<React.SetStateAction<BookState>>;
 
 const AGENT_ID = 'eef314c9-183b-4d87-9d6c-88815a72be15';
@@ -190,6 +215,7 @@ const DEFAULT_STATE: BookState = {
   outline: null,
   currentChapterId: null,
   chaptersContent: {},
+  chapterReviewTelemetry: {},
   backendProjectId: null,
   backendMetadata: {},
   updatedAt: new Date().toISOString(),
@@ -219,6 +245,9 @@ const readState = (): BookState => {
       ...parsed,
       outline: parsed.outline || null,
       chaptersContent: parsed.chaptersContent || {},
+      chapterReviewTelemetry: (parsed.chapterReviewTelemetry && typeof parsed.chapterReviewTelemetry === 'object')
+        ? parsed.chapterReviewTelemetry as Record<number, ChapterReviewTelemetry>
+        : {},
       backendProjectId: parsed.backendProjectId || null,
       backendMetadata: (parsed.backendMetadata && typeof parsed.backendMetadata === 'object') ? parsed.backendMetadata : {},
       frontMatter: Array.isArray(parsed.frontMatter) ? parsed.frontMatter : DEFAULT_STATE.frontMatter,
@@ -589,6 +618,53 @@ const extractRunProgress = (source: AgentRunRecord | AgentOutputs | null | undef
   return {
     label: nodeLabelFromKey(nodeKey),
     revisionCount,
+  };
+};
+
+const extractChapterReviewTelemetry = (outputs: AgentOutputs): ChapterReviewTelemetry | null => {
+  const metadata = toRecord(outputs.metadata);
+  const review = toRecord(metadata.review);
+  if (!Object.keys(review).length) {
+    return null;
+  }
+
+  const asInt = (value: unknown): number | null => {
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return Math.trunc(value);
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : null;
+  };
+
+  const issues = Array.isArray(review.issues)
+    ? review.issues.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  const profileComplianceIssues = Array.isArray(review.profile_compliance_issues)
+    ? review.profile_compliance_issues.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+  const fallbackStages = Array.isArray(outputs.fallback_stages)
+    ? outputs.fallback_stages.map((item) => String(item).trim()).filter(Boolean)
+    : [];
+
+  const timings = toRecord(outputs.timings_ms);
+  const timingNodes = toRecord(timings.nodes);
+
+  return {
+    score: asInt(review.score),
+    explicitShouldRevise: Boolean(review.should_revise),
+    effectiveShouldRevise: Boolean(review.effective_should_revise),
+    revisionCount: asInt(outputs.progress?.revision_count),
+    issues,
+    critique: typeof review.critique === 'string' ? review.critique.trim() : '',
+    wordCount: asInt(review.word_count),
+    minimumWordCount: asInt(review.minimum_word_count),
+    guardrailFail: Boolean(review.guardrail_fail),
+    profileComplianceFail: Boolean(review.profile_compliance_fail),
+    profileComplianceIssues,
+    fallbackStages,
+    usedFallback: Boolean(outputs.used_fallback),
+    runMs: asInt(timingNodes.run_chapter_ms ?? timings.total_ms),
+    generatedAt: new Date().toISOString(),
   };
 };
 
@@ -2142,6 +2218,7 @@ const DraftingStep: React.FC<{
   if (!bookState.outline) return <div className="rounded-3xl border border-white/80 bg-[linear-gradient(135deg,rgba(255,255,255,0.96),rgba(236,254,250,0.88),rgba(255,244,226,0.92))] p-8 text-center shadow-[0_14px_40px_-24px_rgba(8,47,73,0.34)] backdrop-blur-xl">No outline available.</div>;
   const current = bookState.outline.chapters.find((c) => c.number === bookState.currentChapterId) || null;
   const content = current ? bookState.chaptersContent[current.number] || '' : '';
+  const currentReviewTelemetry = current ? bookState.chapterReviewTelemetry[current.number] || null : null;
   const gen = async (n: number) => {
     setLoading(true);
     try {
@@ -2149,7 +2226,16 @@ const DraftingStep: React.FC<{
       const outputs = await executeAgent('chapter', inputs);
       onRun('chapter', outputs);
       if (isSuccess(outputs) && outputs.chapter?.content) {
-        setBookState((p) => ({ ...p, chaptersContent: { ...p.chaptersContent, [n]: outputs.chapter?.content || '' }, currentChapterId: n, updatedAt: new Date().toISOString() }));
+        const reviewTelemetry = extractChapterReviewTelemetry(outputs);
+        setBookState((p) => ({
+          ...p,
+          chaptersContent: { ...p.chaptersContent, [n]: outputs.chapter?.content || '' },
+          chapterReviewTelemetry: reviewTelemetry
+            ? { ...p.chapterReviewTelemetry, [n]: reviewTelemetry }
+            : p.chapterReviewTelemetry,
+          currentChapterId: n,
+          updatedAt: new Date().toISOString()
+        }));
         toast.success(`Chapter ${n} generated.`);
       } else toast.error(outputs.errors?.[0] || 'Chapter generation failed.');
     } catch (error) {
@@ -2236,6 +2322,80 @@ const DraftingStep: React.FC<{
         >
           Go To Export
         </button>
+        {currentReviewTelemetry && (
+          <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50 p-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Latest Review</div>
+              <div className="text-[10px] font-semibold text-slate-500">
+                {new Date(currentReviewTelemetry.generatedAt).toLocaleTimeString()}
+              </div>
+            </div>
+            <div className="mb-2 flex flex-wrap gap-1.5">
+              {currentReviewTelemetry.score !== null && (
+                <span className={`rounded-md px-2 py-1 text-[10px] font-bold ${
+                  currentReviewTelemetry.score >= 85
+                    ? 'bg-emerald-50 text-emerald-700'
+                    : currentReviewTelemetry.score >= 70
+                      ? 'bg-amber-50 text-amber-700'
+                      : 'bg-rose-50 text-rose-700'
+                }`}>
+                  Score {currentReviewTelemetry.score}
+                </span>
+              )}
+              {currentReviewTelemetry.revisionCount !== null && (
+                <span className="rounded-md bg-white px-2 py-1 text-[10px] font-bold text-slate-700 ring-1 ring-slate-200">
+                  Revisions {currentReviewTelemetry.revisionCount}
+                </span>
+              )}
+              {currentReviewTelemetry.runMs !== null && (
+                <span className="rounded-md bg-white px-2 py-1 text-[10px] font-bold text-slate-700 ring-1 ring-slate-200">
+                  {Math.max(0, Math.round(currentReviewTelemetry.runMs / 1000))}s
+                </span>
+              )}
+              {currentReviewTelemetry.guardrailFail && (
+                <span className="rounded-md bg-amber-50 px-2 py-1 text-[10px] font-bold text-amber-700">
+                  Guardrail Trigger
+                </span>
+              )}
+              {currentReviewTelemetry.profileComplianceFail && (
+                <span className="rounded-md bg-indigo-50 px-2 py-1 text-[10px] font-bold text-indigo-700">
+                  Profile Drift
+                </span>
+              )}
+              {currentReviewTelemetry.usedFallback && (
+                <span className="rounded-md bg-slate-100 px-2 py-1 text-[10px] font-bold text-slate-700">
+                  Fallback
+                </span>
+              )}
+            </div>
+            {(currentReviewTelemetry.wordCount !== null || currentReviewTelemetry.minimumWordCount !== null) && (
+              <div className="mb-2 text-xs text-slate-600">
+                Word count {currentReviewTelemetry.wordCount ?? '-'}
+                {currentReviewTelemetry.minimumWordCount !== null ? ` / min ${currentReviewTelemetry.minimumWordCount}` : ''}
+              </div>
+            )}
+            {currentReviewTelemetry.issues.length > 0 && (
+              <div className="mb-2">
+                <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Review Issues</div>
+                <ul className="list-inside list-disc space-y-1 text-xs leading-relaxed text-slate-600">
+                  {currentReviewTelemetry.issues.slice(0, 5).map((issue, index) => (
+                    <li key={`${issue}-${index}`}>{issue}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+            {currentReviewTelemetry.critique && (
+              <div className="rounded-md border border-slate-200 bg-white p-2 text-xs leading-relaxed text-slate-600">
+                <span className="font-semibold text-slate-700">Revision guidance:</span> {currentReviewTelemetry.critique}
+              </div>
+            )}
+            {currentReviewTelemetry.fallbackStages.length > 0 && (
+              <div className="mt-2 text-[11px] text-slate-500">
+                Fallback stages: {currentReviewTelemetry.fallbackStages.join(', ')}
+              </div>
+            )}
+          </div>
+        )}
         {current && (
           <div className="mt-6 rounded-xl border border-slate-100 bg-slate-50 p-4">
             <div className="mb-2 text-[10px] font-bold uppercase tracking-widest text-slate-500">Chapter Goal</div>
