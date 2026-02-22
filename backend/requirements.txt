@@ -1,0 +1,12 @@
+django==5.1.4
+djangorestframework==3.15.2
+django-cors-headers==4.6.0
+celery==5.4.0
+redis==5.2.1
+python-dotenv==1.0.1
+openai==1.58.1
+langgraph==0.2.75
+qdrant-client==1.12.1
+pypdf==5.4.0
+reportlab==4.2.5
+python-docx==1.1.2
