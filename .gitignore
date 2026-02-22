@@ -11,6 +11,13 @@ backend/db.sqlite3
 backend/staticfiles/
 .env
 backend/.env
+frontend/.env
+.env.*
+backend/.env.*
+frontend/.env.*
+!.env.example
+!backend/.env.example
+!frontend/.env.example
 
 # Node
 node_modules/

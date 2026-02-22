@@ -172,6 +172,7 @@ _PROFILE_CONVERSATION_GUIDANCE = (
     "Treat chapter length and total word count as linked decisions because together they imply an approximate chapter count. "
     "Treat many current form values as defaults unless the conversation clearly confirms them. "
     "Do not re-ask details the user already clearly provided in conversation or current form state. "
+    "Once required details are covered, proactively offer finalize (or a short optional-details batch) instead of waiting for the user to guess the command. "
     "Optional items can be skipped and offered near the end as a short batch "
     "(subtitle/CTA, style references, boundaries, front/back matter, rich elements)."
 )
@@ -614,6 +615,7 @@ class LLMService:
                 "Do not use technical field names in the reply. "
                 "Treat current form values as context (some may be defaults) and avoid re-asking what is already clear. "
                 "Do not narrate default form values as if the user personally provided them. "
+                "If the user gives an age range for children/teens, fold that into audience (and beginner level if appropriate). "
                 "If required details are covered, you may offer a short optional-details batch before asking for finalize."
             ),
             schema=_PROFILE_ASSISTANT_SCHEMA,
@@ -643,6 +645,7 @@ class LLMService:
                     "Do not mention internal field names unless the user asks.\n"
                     "Suggestions must be short reply options the user might actually type next (not questions).\n"
                     "Each suggestion should be under 10 words.\n"
+                    "Suggestions should directly answer your latest question, not propose workflow jumps.\n"
                     "Suggestions must be generic enough to stay useful regardless of topic (e.g. brainstorming, confirmation, preference statements).\n"
                     "Never guess the user's specific topic/content in suggestions.\n"
                     "If all required fields are present but the latest user message does not explicitly confirm finalize, "
@@ -750,6 +753,11 @@ class LLMService:
             user_message=user_message,
             conversation=conversation or [],
         )
+        updates = _augment_assistant_updates_from_context(
+            updates=updates,
+            current_profile=current_profile,
+            user_message=user_message,
+        )
 
         merged = dict(current_profile)
         merged.update(updates)
@@ -773,8 +781,11 @@ class LLMService:
 
         if missing_required:
             is_finalized = False
-            if next_field not in missing_required:
+            if not next_field:
                 next_field = _next_missing_required_field(merged) or missing_required[0]
+            elif next_field in updates and next_field not in missing_required:
+                # Move forward when the model captured a field this turn but forgot to advance.
+                next_field = _next_missing_required_field(merged) or next_field
             
             if finalize_intent:
                 # User tried to finalize but we are missing stuff
@@ -813,6 +824,12 @@ class LLMService:
             next_field=next_field,
             profile=merged,
             is_finalized=is_finalized,
+        )
+        suggestions = _filter_assistant_suggestions_for_context(
+            suggestions=suggestions,
+            next_field=next_field,
+            missing_required=missing_required,
+            profile=merged,
         )
 
         return {
@@ -1071,6 +1088,7 @@ def _sanitize_assistant_updates(
 
     # Do not allow assistant-generated placeholders/greetings to satisfy title.
     if not _is_valid_profile_title(updated_title):
+        logger.debug("Dropping assistant title update as placeholder/invalid: %r", updated_title)
         cleaned.pop("title", None)
         return cleaned
 
@@ -1081,9 +1099,58 @@ def _sanitize_assistant_updates(
             _is_affirmative_confirmation(user_message)
             and _assistant_recently_mentions_value(updated_title, conversation)
         )
+        if title_is_confirmed:
+            logger.debug("Accepting assistant-proposed title via user confirmation: %r", updated_title)
         if not (title_is_grounded or title_is_confirmed):
+            logger.debug(
+                "Dropping assistant title update as ungrounded (title=%r, user_message=%r)",
+                updated_title,
+                user_message,
+            )
             cleaned.pop("title", None)
     return cleaned
+
+
+def _augment_assistant_updates_from_context(
+    updates: Dict[str, Any],
+    current_profile: Dict[str, Any],
+    user_message: str,
+) -> Dict[str, Any]:
+    """
+    Preserve useful audience info when the user gives an age band (e.g. 10-14)
+    but the model treats it as conversational context instead of a field update.
+    """
+    enriched = dict(updates)
+    age_band = _extract_age_band(user_message)
+    if not age_band:
+        return enriched
+
+    audience_current = str(enriched.get("audience") or current_profile.get("audience") or "").strip()
+    context_text = f"{user_message} {audience_current}".lower()
+    if not re.search(r"\b(kid|kids|child|children|teen|teens)\b", context_text):
+        return enriched
+
+    if "audience" not in enriched:
+        if audience_current and not re.search(r"\b\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\b", audience_current):
+            if re.search(r"\b(kid|kids|child|children|teen|teens)\b", audience_current.lower()):
+                enriched["audience"] = f"{audience_current} ages {age_band}"
+        elif not audience_current or audience_current.lower() in {"general readers", "readers"}:
+            enriched["audience"] = f"Kids ages {age_band}"
+
+    if "audienceKnowledgeLevel" not in enriched:
+        current_level = str(current_profile.get("audienceKnowledgeLevel", "")).strip()
+        if not current_level or current_level == "Complete Beginner":
+            enriched["audienceKnowledgeLevel"] = "Complete Beginner"
+
+    return enriched
+
+
+def _extract_age_band(text: str) -> str:
+    match = re.search(r"\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\b", str(text or ""), flags=re.IGNORECASE)
+    if not match:
+        return ""
+    start, end = match.group(1), match.group(2)
+    return f"{start}-{end}"
 
 
 def _is_finalize_intent(message: str) -> bool:
@@ -1297,6 +1364,21 @@ def _is_affirmative_confirmation(message: str) -> bool:
         return True
     if "yes" in text and any(token in text for token in ("title", "name", "good", "fine", "great")):
         return True
+    if any(phrase in text for phrase in (
+        "i like that title",
+        "i like this title",
+        "i love that title",
+        "i love this title",
+        "that title works",
+        "this title works",
+        "use that title",
+        "keep that title",
+        "i like that name",
+        "that name works",
+    )):
+        return True
+    if any(token in text for token in ("like", "love", "works", "perfect")) and any(token in text for token in ("title", "name")):
+        return True
     return False
 
 
@@ -1357,6 +1439,48 @@ def _normalize_assistant_suggestions(
     if suggestions:
         return suggestions
     return _assistant_suggestion_fallback(next_field, profile)
+
+
+def _filter_assistant_suggestions_for_context(
+    suggestions: List[str],
+    next_field: str,
+    missing_required: List[str],
+    profile: Dict[str, Any],
+) -> List[str]:
+    if not suggestions:
+        return suggestions
+
+    filtered: List[str] = []
+    for suggestion in suggestions:
+        text = _normalize_for_match(suggestion)
+        if not text:
+            continue
+        if missing_required and any(token in text for token in ("finalize", "finalise", "confirm", "apply")):
+            continue
+        if _looks_like_meta_workflow_suggestion(text):
+            continue
+        if "chapter length" in text and next_field != "chapterLength":
+            continue
+        filtered.append(suggestion)
+
+    filtered = _ordered_unique_fields(filtered)[:3]
+    if filtered:
+        return filtered
+    return _assistant_suggestion_fallback(next_field, profile)
+
+
+def _looks_like_meta_workflow_suggestion(normalized_text: str) -> bool:
+    prefixes = (
+        "lets ",
+        "let s ",
+        "move on",
+        "go to ",
+        "next step",
+        "discuss more",
+        "talk more",
+        "skip ",
+    )
+    return any(normalized_text.startswith(prefix) for prefix in prefixes)
 
 
 def _looks_like_assumptive_content_guess(text: str) -> bool:
