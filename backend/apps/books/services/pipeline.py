@@ -39,16 +39,23 @@ class BookWorkflowService:
         payload = self.llm.generate_outline(project, knowledge_context=kb_context)
         outline = self._normalize_outline(payload.get("outline", {}))
         fallback_info = self._runtime_fallback_info(payload)
+        outline_profile_compliance = self._outline_profile_compliance(project, outline)
+        llm_runtime_meta = self._merge_dicts(
+            payload.get("metadata", {}),
+            {"profile_compliance": outline_profile_compliance},
+        )
 
         project.outline_json = outline
-        project.metadata_json = self._merge_project_metadata(project, payload.get("metadata", {}))
+        project.metadata_json = self._merge_project_metadata(project, llm_runtime_meta)
         project.status = ProjectStatus.OUTLINED
         project.updated_at = timezone.now()
         project.save(update_fields=["outline_json", "metadata_json", "status", "updated_at"])
 
         self._sync_chapters_from_outline(project, outline)
 
-        return {
+        warnings = list(outline_profile_compliance.get("issues", [])) if outline_profile_compliance.get("fail") else []
+
+        response = {
             "status": "success",
             "outline": outline,
             "metadata": project.metadata_json,
@@ -63,6 +70,9 @@ class BookWorkflowService:
                 ],
             ),
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     def _run_refine_toc(self, project: BookProject, inputs: Dict[str, Any]) -> Dict[str, Any]:
         feedback = str(inputs.get("feedback", "")).strip()
@@ -82,16 +92,23 @@ class BookWorkflowService:
         )
         outline = self._normalize_outline(payload.get("outline", {}))
         fallback_info = self._runtime_fallback_info(payload)
+        outline_profile_compliance = self._outline_profile_compliance(project, outline)
+        llm_runtime_meta = self._merge_dicts(
+            payload.get("metadata", {}),
+            {"profile_compliance": outline_profile_compliance},
+        )
 
         project.outline_json = outline
-        project.metadata_json = self._merge_project_metadata(project, payload.get("metadata", {}))
+        project.metadata_json = self._merge_project_metadata(project, llm_runtime_meta)
         project.status = ProjectStatus.OUTLINED
         project.updated_at = timezone.now()
         project.save(update_fields=["outline_json", "metadata_json", "status", "updated_at"])
 
         self._sync_chapters_from_outline(project, outline)
 
-        return {
+        warnings = list(outline_profile_compliance.get("issues", [])) if outline_profile_compliance.get("fail") else []
+
+        response = {
             "status": "success",
             "outline": outline,
             "metadata": project.metadata_json,
@@ -105,6 +122,9 @@ class BookWorkflowService:
                 ],
             ),
         }
+        if warnings:
+            response["warnings"] = warnings
+        return response
 
     def _run_profile_assistant(self, project: BookProject, inputs: Dict[str, Any]) -> Dict[str, Any]:
         message = str(inputs.get("message", "")).strip()
@@ -519,6 +539,82 @@ class BookWorkflowService:
         if "instruction_brief" in user_concept:
             merged["instruction_brief"] = user_concept["instruction_brief"]
         return merged
+
+    def _outline_profile_compliance(self, project: BookProject, outline: Dict[str, Any]) -> Dict[str, Any]:
+        profile = self._project_profile(project)
+        checks: Dict[str, Any] = {}
+        issues: List[str] = []
+
+        chapters = outline.get("chapters", []) if isinstance(outline, dict) else []
+        if not isinstance(chapters, list):
+            chapters = []
+        chapter_count = len(chapters)
+        checks["chapter_count"] = chapter_count
+
+        empty_bullet_chapters: List[int] = []
+        for chapter in chapters:
+            if not isinstance(chapter, dict):
+                continue
+            bullet_points = chapter.get("bullet_points", [])
+            if not isinstance(bullet_points, list):
+                empty_bullet_chapters.append(int(chapter.get("number", 0)))
+                continue
+            non_empty_points = [bp for bp in bullet_points if str(bp).strip()]
+            if not non_empty_points:
+                empty_bullet_chapters.append(int(chapter.get("number", 0)))
+        if empty_bullet_chapters:
+            issues.append(
+                f"Outline compliance: chapters without bullet points: {', '.join(str(n) for n in empty_bullet_chapters)}."
+            )
+            checks["empty_bullet_chapters"] = empty_bullet_chapters
+
+        chapter_length = str(profile.get("chapterLength", "")).strip().lower()
+        words_per_chapter = 0
+        if "short" in chapter_length:
+            words_per_chapter = 1500
+        elif "medium" in chapter_length:
+            words_per_chapter = 3000
+        elif "long" in chapter_length:
+            words_per_chapter = 5000
+
+        target_word_count = 0
+        try:
+            target_word_count = max(0, int(float(str(profile.get("length", project.target_word_count) or 0))))
+        except Exception:
+            target_word_count = max(0, int(project.target_word_count or 0))
+
+        if words_per_chapter > 0 and target_word_count > 0 and chapter_count > 0:
+            expected_chapters = max(1, round(target_word_count / words_per_chapter))
+            deviation = abs(chapter_count - expected_chapters)
+            deviation_ratio = deviation / max(1, expected_chapters)
+            checks["chapter_count_vs_length"] = {
+                "target_word_count": target_word_count,
+                "chapter_length": str(profile.get("chapterLength", "")).strip(),
+                "expected_chapters": expected_chapters,
+                "actual_chapters": chapter_count,
+                "deviation": deviation,
+                "deviation_ratio": round(deviation_ratio, 2),
+            }
+            if deviation_ratio > 0.6 and deviation >= 2:
+                issues.append(
+                    "Outline compliance: chapter count may not match the selected chapter length and total word count."
+                )
+
+        return {
+            "fail": bool(issues),
+            "issues": issues,
+            "checks": checks,
+        }
+
+    def _project_profile(self, project: BookProject) -> Dict[str, Any]:
+        metadata = project.metadata_json if isinstance(project.metadata_json, dict) else {}
+        user_concept = metadata.get("user_concept", {})
+        if isinstance(user_concept, dict):
+            profile = user_concept.get("profile", {})
+            if isinstance(profile, dict):
+                return profile
+        legacy_profile = metadata.get("profile", {})
+        return legacy_profile if isinstance(legacy_profile, dict) else {}
 
     def _build_user_concept_snapshot(self, project: BookProject, existing_meta: Dict[str, Any]) -> Dict[str, Any]:
         existing_user = existing_meta.get("user_concept", {})

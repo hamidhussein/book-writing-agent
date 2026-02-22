@@ -66,15 +66,21 @@ class MetadataPreservationTests(TestCase):
 
         service = BookWorkflowService()
         before_user_concept = deepcopy(self.project.metadata_json["user_concept"])
-        service.execute_mode(self.project, "toc", {})
+        output = service.execute_mode(self.project, "toc", {})
 
         self.project.refresh_from_db()
         metadata = self.project.metadata_json
         self.assertEqual(metadata.get("user_concept"), before_user_concept)
-        self.assertEqual(metadata.get("llm_runtime"), payload["metadata"])
+        llm_runtime = metadata.get("llm_runtime", {})
+        self.assertEqual(llm_runtime.get("estimated_word_count"), 4500)
+        self.assertEqual(llm_runtime.get("chapter_count"), 2)
+        self.assertEqual(llm_runtime.get("profile", {}).get("writingStyle"), "Drifted")
+        self.assertIn("profile_compliance", llm_runtime)
+        self.assertIsInstance(llm_runtime.get("profile_compliance"), dict)
         self.assertEqual(metadata.get("profile", {}).get("writingStyle"), "Analytical")
         self.assertEqual(metadata.get("subtitle"), "Original subtitle")
         self.assertEqual(metadata.get("instruction_brief"), "Keep it practical.")
+        self.assertNotIn("warnings", output)
 
     @patch("apps.books.services.pipeline.VectorMemoryStore")
     @patch("apps.books.services.pipeline.LLMService")
@@ -99,13 +105,17 @@ class MetadataPreservationTests(TestCase):
 
         service = BookWorkflowService()
         before_user_concept = deepcopy(self.project.metadata_json["user_concept"])
-        service.execute_mode(self.project, "refine_toc", {"feedback": "Tighten chapter titles."})
+        output = service.execute_mode(self.project, "refine_toc", {"feedback": "Tighten chapter titles."})
 
         self.project.refresh_from_db()
         metadata = self.project.metadata_json
         self.assertEqual(metadata.get("user_concept"), before_user_concept)
-        self.assertEqual(metadata.get("llm_runtime"), refine_payload["metadata"])
+        llm_runtime = metadata.get("llm_runtime", {})
+        self.assertEqual(llm_runtime.get("chapter_count"), 2)
+        self.assertEqual(llm_runtime.get("themes"), ["clarity", "progression"])
+        self.assertIn("profile_compliance", llm_runtime)
         self.assertEqual(self.project.outline_json.get("chapters", [])[0].get("title"), "Start Better")
+        self.assertNotIn("warnings", output)
 
     def test_profile_block_prefers_user_concept_profile_over_legacy_root(self):
         self.project.metadata_json = {
@@ -116,3 +126,37 @@ class MetadataPreservationTests(TestCase):
         self.assertIn('"tone": "Academic"', block)
         self.assertIn('"writingStyle": "Instructional"', block)
         self.assertNotIn('"tone": "Humorous"', block)
+
+    @patch("apps.books.services.pipeline.VectorMemoryStore")
+    @patch("apps.books.services.pipeline.LLMService")
+    def test_toc_adds_outline_profile_compliance_warning_for_count_mismatch(self, mock_llm_cls, mock_store_cls):
+        mock_store_cls.return_value.search_knowledge_base.return_value = []
+        llm = mock_llm_cls.return_value
+        llm.generate_outline.return_value = {
+            "outline": {
+                "synopsis": "A practical guide.",
+                "chapters": [
+                    {"number": 1, "title": "Start", "bullet_points": ["Context"]},
+                    {"number": 2, "title": "Middle", "bullet_points": ["Build"]},
+                    {"number": 3, "title": "Advanced", "bullet_points": ["Deepen"]},
+                    {"number": 4, "title": "Finish", "bullet_points": ["Close"]},
+                ],
+            },
+            "metadata": {"chapter_count": 4},
+        }
+        self.project.metadata_json["user_concept"]["profile"]["chapterLength"] = "Long ~5000w"
+        self.project.metadata_json["user_concept"]["profile"]["length"] = 4500
+        self.project.save(update_fields=["metadata_json"])
+
+        service = BookWorkflowService()
+        output = service.execute_mode(self.project, "toc", {})
+
+        warnings = output.get("warnings", [])
+        self.assertTrue(warnings)
+        self.assertTrue(any("chapter count may not match" in str(w).lower() for w in warnings))
+        self.project.refresh_from_db()
+        compliance = self.project.metadata_json.get("llm_runtime", {}).get("profile_compliance", {})
+        self.assertTrue(compliance.get("fail"))
+        checks = compliance.get("checks", {}).get("chapter_count_vs_length", {})
+        self.assertEqual(checks.get("expected_chapters"), 1)
+        self.assertEqual(checks.get("actual_chapters"), 4)

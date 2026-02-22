@@ -166,6 +166,38 @@ class _FallbackStageLLM(_FakeLLM):
         }
 
 
+class _ProfileComplianceDrivenLLM(_FakeLLM):
+    def draft_or_revise_chapter(self, chapter_number, **_kwargs):
+        self.draft_calls += 1
+        # Intentionally avoids second-person pronouns to trigger POV compliance checks.
+        long_text = ("students explore models and practice reasoning with guided examples. " * 170).strip()
+        return {
+            "chapter": {
+                "number": chapter_number,
+                "title": "Foundations",
+                "content": f"# Foundations\n\n## Core Section\n\n{long_text}",
+                "summary": "Draft summary.",
+            },
+            "metadata": {"draft_call": self.draft_calls},
+            "next_steps": ["Review"],
+            "used_fallback": False,
+            "fallback_stage": "",
+        }
+
+    def review_chapter(self, **_kwargs):
+        self.review_calls += 1
+        return {
+            "review": {
+                "score": 95,
+                "should_revise": False,
+                "issues": [],
+                "critique": "",
+            },
+            "used_fallback": False,
+            "fallback_stage": "",
+        }
+
+
 class _FakeWorkflow:
     def __init__(self, llm=None) -> None:
         self.llm = llm or _FakeLLM()
@@ -283,3 +315,32 @@ class ChapterGraphTests(TestCase):
 
         self.assertTrue(output.get("used_fallback"))
         self.assertEqual(output.get("fallback_stages"), ["chapter_plan", "chapter_review"])
+
+    @patch("apps.books.services.pipeline.VectorMemoryStore")
+    def test_profile_compliance_guardrails_trigger_revision_for_pov_drift(self, _mock_store_cls):
+        self.project.metadata_json = {
+            "user_concept": {
+                "profile": {
+                    "pointOfView": "Second Person",
+                    "chapterLength": "Short ~1500w",
+                }
+            }
+        }
+        self.project.save(update_fields=["metadata_json"])
+
+        orchestrator = AgentOrchestrator()
+        fake_workflow = _FakeWorkflow(llm=_ProfileComplianceDrivenLLM())
+        orchestrator.workflow = fake_workflow
+
+        run = AgentRun(project=self.project, mode="chapter", input_payload={"chapter_number": 1})
+        output = orchestrator.execute(run)
+
+        self.assertEqual(fake_workflow.llm.draft_calls, 3)
+        self.assertEqual(fake_workflow.llm.review_calls, 3)
+        review_meta = output.get("metadata", {}).get("review", {})
+        self.assertTrue(review_meta.get("profile_compliance_fail"))
+        self.assertTrue(review_meta.get("guardrail_fail"))
+        self.assertTrue(review_meta.get("effective_should_revise"))
+        self.assertIn("profile_compliance", review_meta)
+        issues = review_meta.get("profile_compliance_issues", [])
+        self.assertTrue(any("second-person voice" in str(issue).lower() for issue in issues))

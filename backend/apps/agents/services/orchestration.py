@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any, Dict, List, TypedDict
 
@@ -444,10 +445,15 @@ class AgentOrchestrator:
         critique = str(review.get("critique", "")).strip()
 
         guardrail_issues, word_count, minimum_word_count = self._review_guardrails(project, content)
+        profile_compliance = self._profile_compliance_guardrails(project, content)
         for issue in guardrail_issues:
             if issue not in issues:
                 issues.append(issue)
-        guardrail_fail = bool(guardrail_issues)
+        for issue in profile_compliance.get("issues", []):
+            if issue not in issues:
+                issues.append(issue)
+        profile_compliance_fail = bool(profile_compliance.get("fail"))
+        guardrail_fail = bool(guardrail_issues) or profile_compliance_fail
         effective_should_revise = explicit_should_revise or score < 80 or guardrail_fail
         if effective_should_revise and not critique:
             critique = "Revise for stronger concept alignment, add depth, and improve section structure."
@@ -457,6 +463,9 @@ class AgentOrchestrator:
         review["effective_should_revise"] = effective_should_revise
         review["guardrail_fail"] = guardrail_fail
         review["guardrail_issues"] = guardrail_issues
+        review["profile_compliance"] = profile_compliance
+        review["profile_compliance_fail"] = profile_compliance_fail
+        review["profile_compliance_issues"] = profile_compliance.get("issues", [])
         review["word_count"] = word_count
         review["minimum_word_count"] = minimum_word_count
         review["issues"] = issues
@@ -470,6 +479,7 @@ class AgentOrchestrator:
             optional_meta={
                 "score": score,
                 "effective_should_revise": effective_should_revise,
+                "profile_compliance_fail": profile_compliance_fail,
                 "used_fallback": bool(review_payload.get("used_fallback")) if isinstance(review_payload, dict) else False,
             },
             revision_count=int(state.get("revision_count", 0)),
@@ -709,6 +719,60 @@ class AgentOrchestrator:
         if word_count < minimum_word_count:
             issues.append(f"Chapter word count {word_count} is below minimum {minimum_word_count}.")
         return issues, word_count, minimum_word_count
+
+    def _profile_compliance_guardrails(self, project: BookProject, content: str) -> Dict[str, Any]:
+        """
+        Lightweight deterministic compliance checks against the saved concept profile.
+        These are heuristics (not semantic truth), but they help catch obvious drift.
+        """
+        profile = self._project_profile(project)
+        text = str(content or "")
+        normalized = text.lower()
+        word_tokens = [token for token in re.findall(r"[A-Za-z']+", text) if token]
+        word_count = len(word_tokens)
+        issues: List[str] = []
+        checks: Dict[str, Any] = {}
+
+        point_of_view = str(profile.get("pointOfView", "")).strip().lower()
+        if point_of_view.startswith("second"):
+            second_person_hits = len(re.findall(r"\b(you|your|yours|yourself)\b", normalized))
+            checks["pointOfView"] = {
+                "target": "Second Person",
+                "second_person_hits": second_person_hits,
+            }
+            if word_count >= 120 and second_person_hits == 0:
+                issues.append("Profile compliance: chapter does not appear to use second-person voice (you/your).")
+        elif point_of_view.startswith("first"):
+            first_person_hits = len(re.findall(r"\b(i|me|my|mine|myself|we|our|ours|ourselves)\b", normalized))
+            checks["pointOfView"] = {
+                "target": "First Person",
+                "first_person_hits": first_person_hits,
+            }
+            if word_count >= 120 and first_person_hits == 0:
+                issues.append("Profile compliance: chapter does not appear to use first-person voice (I/we).")
+
+        vocabulary_level = str(profile.get("vocabularyLevel", "")).strip().lower()
+        audience_level = str(profile.get("audienceKnowledgeLevel", "")).strip().lower()
+        if word_tokens and (vocabulary_level == "simple" or "beginner" in audience_level):
+            long_word_count = len([token for token in word_tokens if len(token) >= 12])
+            avg_word_length = sum(len(token) for token in word_tokens) / max(1, word_count)
+            long_word_ratio = long_word_count / max(1, word_count)
+            checks["readability"] = {
+                "target_vocabulary": str(profile.get("vocabularyLevel", "")).strip(),
+                "target_audience_level": str(profile.get("audienceKnowledgeLevel", "")).strip(),
+                "avg_word_length": round(avg_word_length, 2),
+                "long_word_ratio": round(long_word_ratio, 3),
+                "word_count": word_count,
+            }
+            # Keep thresholds conservative to avoid noisy false positives.
+            if word_count >= 180 and (avg_word_length > 6.7 or long_word_ratio > 0.07):
+                issues.append("Profile compliance: wording may be too technical for a beginner/simple vocabulary target.")
+
+        return {
+            "fail": bool(issues),
+            "issues": issues,
+            "checks": checks,
+        }
 
     def _minimum_word_count_for_project(self, project: BookProject) -> int:
         profile = self._project_profile(project)
