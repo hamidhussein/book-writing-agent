@@ -221,6 +221,8 @@ _PROFILE_FORM_DEFAULTS: Dict[str, Any] = {
     "length": 3000,
 }
 
+_OPTIONAL_BATCH_MIN_CONVERSATION_TURNS = 6
+
 
 class LLMService:
     """
@@ -762,12 +764,26 @@ class LLMService:
         merged = dict(current_profile)
         merged.update(updates)
         optional_missing = _missing_optional_profile_fields(merged)
+        conversation_turn_count = 0
+        for turn in (conversation or []):
+            if not isinstance(turn, dict):
+                continue
+            role = str(turn.get("role", "")).strip().lower()
+            content = str(turn.get("content", "")).strip()
+            if role in {"assistant", "user"} and content:
+                conversation_turn_count += 1
+        allow_optional_batch = conversation_turn_count >= _OPTIONAL_BATCH_MIN_CONVERSATION_TURNS
 
         raw_missing = payload.get("missing_required", [])
+        computed_missing = _missing_required_profile(merged)
+        computed_missing_set = set(computed_missing)
         model_missing: List[str] = []
         if isinstance(raw_missing, list):
-            model_missing = [str(item).strip() for item in raw_missing if str(item).strip() in _REQUIRED_PROFILE_FIELDS]
-        computed_missing = _missing_required_profile(merged)
+            model_missing = [
+                str(item).strip()
+                for item in raw_missing
+                if str(item).strip() in _REQUIRED_PROFILE_FIELDS and str(item).strip() in computed_missing_set
+            ]
         missing_required = _ordered_unique_fields(model_missing + computed_missing)
 
         next_field_raw = str(payload.get("next_field", "")).strip()
@@ -790,6 +806,9 @@ class LLMService:
             if finalize_intent:
                 # User tried to finalize but we are missing stuff
                 reply = f"Before finalizing, I still need one detail: {next_field}. {_question_for_field(next_field)}"
+            elif _reply_claims_completion(reply):
+                # Correct false completion claims when required fields are still missing.
+                reply = _question_for_field(next_field)
             elif not reply:
                 # No reply from LLM, use fallback question
                 reply = _question_for_field(next_field)
@@ -806,7 +825,7 @@ class LLMService:
                 if next_field and next_field not in optional_missing:
                     next_field = ""
 
-                if optional_missing:
+                if optional_missing and allow_optional_batch:
                     if not next_field:
                         next_field = _next_missing_optional_field(merged) or ""
                     if not reply or _reply_claims_completion(reply):
@@ -815,7 +834,11 @@ class LLMService:
                     next_field = ""
                     # Only use the "I have captured all..." message if the LLM provided NO reply
                     # or if the LLM is stuck in a loop of completion claims.
-                    if not reply or _reply_claims_completion(reply):
+                    if (
+                        not reply
+                        or _reply_claims_completion(reply)
+                        or (optional_missing and not allow_optional_batch)
+                    ):
                         reply = "I have captured all required details. If you agree, reply 'finalize' and I will apply them to the form."
 
         raw_suggestions = payload.get("suggestions", [])
@@ -1070,6 +1093,41 @@ def _normalize_profile_value(field: str, value: Any) -> Any:
             return max(300, int(float(str(value).strip())))
         except Exception:
             return 3000
+    if field == "vocabularyLevel":
+        normalized = str(value).strip()
+        mapped = {
+            "basic": "Simple",
+            "beginner": "Simple",
+            "easy": "Simple",
+            "simple": "Simple",
+            "medium": "Intermediate",
+            "moderate": "Intermediate",
+            "intermediate": "Intermediate",
+            "advanced": "Technical",
+            "expert": "Technical",
+            "technical": "Technical",
+            "literary": "Literary",
+        }.get(normalized.lower())
+        return mapped or normalized
+    if field == "tone":
+        normalized = str(value).strip()
+        mapped = {
+            "friendly": "Conversational",
+            "casual": "Conversational",
+            "warm": "Conversational",
+            "chatty": "Conversational",
+            "educational": "Informative",
+            "explanatory": "Informative",
+            "clear": "Informative",
+            "professional": "Formal",
+            "serious": "Formal",
+            "scholarly": "Academic",
+            "motivational": "Inspirational",
+            "encouraging": "Inspirational",
+            "fun": "Humorous",
+            "playful": "Humorous",
+        }.get(normalized.lower())
+        return mapped or normalized
     return str(value).strip()
 
 
@@ -1131,10 +1189,12 @@ def _augment_assistant_updates_from_context(
         return enriched
 
     if "audience" not in enriched:
-        if audience_current and not re.search(r"\b\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\b", audience_current):
+        if audience_current.lower() in {"general readers", "readers"}:
+            enriched["audience"] = f"Kids ages {age_band}"
+        elif audience_current and not re.search(r"\b\d{1,2}\s*(?:-|–|to)\s*\d{1,2}\b", audience_current):
             if re.search(r"\b(kid|kids|child|children|teen|teens)\b", audience_current.lower()):
                 enriched["audience"] = f"{audience_current} ages {age_band}"
-        elif not audience_current or audience_current.lower() in {"general readers", "readers"}:
+        elif not audience_current:
             enriched["audience"] = f"Kids ages {age_band}"
 
     if "audienceKnowledgeLevel" not in enriched:

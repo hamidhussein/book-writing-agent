@@ -103,6 +103,7 @@ interface BookState {
   assistantMissing: string[];
   assistantReadyToFinalize: boolean;
   assistantSuggestions: string[];
+  assistantLastAppliedFields: string[];
 }
 
 interface BackendProject {
@@ -204,6 +205,7 @@ const DEFAULT_STATE: BookState = {
   assistantMissing: [],
   assistantReadyToFinalize: false,
   assistantSuggestions: [],
+  assistantLastAppliedFields: [],
 };
 
 const readState = (): BookState => {
@@ -227,6 +229,7 @@ const readState = (): BookState => {
       assistantNextField: typeof parsed.assistantNextField === 'string' ? parsed.assistantNextField : 'title',
       assistantMissing: Array.isArray(parsed.assistantMissing) ? parsed.assistantMissing : [],
       assistantReadyToFinalize: !!parsed.assistantReadyToFinalize,
+      assistantLastAppliedFields: Array.isArray(parsed.assistantLastAppliedFields) ? parsed.assistantLastAppliedFields.map((v) => String(v)) : [],
     };
   } catch {
     return DEFAULT_STATE;
@@ -1148,6 +1151,9 @@ const ConceptStep: React.FC<{
   const assistantMissing = bookState.assistantMissing || [];
   const assistantReadyToFinalize = !!bookState.assistantReadyToFinalize;
   const assistantNextField = bookState.assistantNextField || 'title';
+  const assistantLastAppliedFields = Array.isArray(bookState.assistantLastAppliedFields)
+    ? bookState.assistantLastAppliedFields
+    : [];
   const assistantUserMessageCount = assistantMessages.filter(
     (msg) => msg.role === 'user' && msg.content.trim().length > 0,
   ).length;
@@ -1232,6 +1238,13 @@ const ConceptStep: React.FC<{
   const assistantFocusLabel = assistantUsesCheckboxChoices
     ? (ASSISTANT_FIELD_LABELS[assistantFocusField] || 'Selections')
     : 'Quick Replies';
+  const toAssistantFieldLabel = (field: string) => ASSISTANT_FIELD_LABELS[field] || PROFILE_LABELS[field] || field;
+  const pendingAssistantFieldLabels = Object.keys(assistantDraft)
+    .filter((field) => field.trim().length > 0)
+    .map(toAssistantFieldLabel);
+  const appliedAssistantFieldLabels = assistantLastAppliedFields
+    .filter((field) => field.trim().length > 0)
+    .map(toAssistantFieldLabel);
   const assistantQuickChoices = useMemo(() => {
     if (assistantUsesCheckboxChoices) {
       return quickChoicesForField(assistantFocusField, assistantReadyToFinalize);
@@ -1315,6 +1328,7 @@ const ConceptStep: React.FC<{
 
       if (response.is_finalized) {
         const finalizedAt = new Date().toISOString();
+        const appliedAssistantFields = Object.keys(nextDraft).filter(Boolean);
         const finalizedState: BookState = {
           ...bookState,
           ...nextDraft,
@@ -1330,6 +1344,7 @@ const ConceptStep: React.FC<{
           assistantNextField: '',
           assistantMissing: [],
           assistantSuggestions: [],
+          assistantLastAppliedFields: appliedAssistantFields,
           updatedAt: finalizedAt,
         }));
         toast.success('Finalized. Fields have been auto-filled from the conversation.');
@@ -1373,6 +1388,13 @@ const ConceptStep: React.FC<{
       return;
     }
     askAssistant(trimmed);
+  };
+
+  const finalizeAssistantDraft = () => {
+    if (assistantBusy || !assistantReadyToFinalize) {
+      return;
+    }
+    askAssistant('yes finalize');
   };
 
   const toggleAssistantCheckedChoice = (label: string) => {
@@ -1801,12 +1823,74 @@ const ConceptStep: React.FC<{
           <div className="rounded-xl border border-slate-100 bg-slate-50 p-4">
             <div className="mb-3 flex flex-wrap items-center gap-2">
               <span className="rounded-md bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-slate-500 shadow-sm">
-                Pending: {Object.keys(assistantDraft).length}
+                Pending: {pendingAssistantFieldLabels.length}
+              </span>
+              <span className="rounded-md bg-white px-2 py-1 text-[10px] font-bold uppercase tracking-widest text-slate-500 shadow-sm">
+                Applied: {appliedAssistantFieldLabels.length}
               </span>
               <span className={`rounded-md px-2 py-1 text-[10px] font-bold uppercase tracking-widest shadow-sm ${assistantReadyToFinalize ? 'bg-emerald-50 text-emerald-700' : 'bg-white text-slate-500'}`}>
                 {assistantReadyToFinalize ? 'Ready to finalize' : 'Collecting brief'}
               </span>
             </div>
+
+            {(pendingAssistantFieldLabels.length > 0 || appliedAssistantFieldLabels.length > 0) && (
+              <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <div className="rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
+                  <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Pending Capture</div>
+                  {pendingAssistantFieldLabels.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {pendingAssistantFieldLabels.slice(0, 5).map((label) => (
+                        <span key={`pending-${label}`} className="rounded-md bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                          {label}
+                        </span>
+                      ))}
+                      {pendingAssistantFieldLabels.length > 5 ? (
+                        <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                          +{pendingAssistantFieldLabels.length - 5} more
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-500">No pending captured values.</div>
+                  )}
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
+                  <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Applied To Form</div>
+                  {appliedAssistantFieldLabels.length > 0 ? (
+                    <div className="flex flex-wrap gap-1.5">
+                      {appliedAssistantFieldLabels.slice(0, 5).map((label) => (
+                        <span key={`applied-${label}`} className="rounded-md bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                          {label}
+                        </span>
+                      ))}
+                      {appliedAssistantFieldLabels.length > 5 ? (
+                        <span className="rounded-md bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
+                          +{appliedAssistantFieldLabels.length - 5} more
+                        </span>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="text-xs text-slate-500">Nothing applied yet. Finalize to sync with the form.</div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {assistantReadyToFinalize && (
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-2.5">
+                <div className="text-xs font-medium text-emerald-700">
+                  Ready to apply captured values to the form.
+                </div>
+                <button
+                  type="button"
+                  onClick={finalizeAssistantDraft}
+                  disabled={assistantBusy}
+                  className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition-colors hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  Finalize & Apply
+                </button>
+              </div>
+            )}
 
             <div ref={assistantViewportRef} className="max-h-[300px] space-y-3 overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 shadow-inner">
               {assistantMessages.map((msg, index) => (
