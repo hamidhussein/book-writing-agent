@@ -340,6 +340,10 @@ class BookWorkflowService:
             {"number": c.number, "title": c.title, "content": c.content, "summary": c.summary}
             for c in chapters
         ]
+        if any(self._has_visual_placeholders(ch.get("content", "")) for ch in chapter_payload):
+            warnings.append(
+                "Figure/flowchart placeholders were preserved in export. Render visual assets in a post-processing step to replace placeholders."
+            )
 
         if export_format in {"pdf", "both"}:
             pdf_bytes = self._render_pdf(project, outline, chapter_payload)
@@ -438,7 +442,7 @@ class BookWorkflowService:
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
         from reportlab.lib.units import inch
-        from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer
+        from reportlab.platypus import PageBreak, Paragraph, Preformatted, SimpleDocTemplate, Spacer
 
         buf = io.BytesIO()
         doc = SimpleDocTemplate(
@@ -453,6 +457,19 @@ class BookWorkflowService:
         h1 = ParagraphStyle("BookH1", parent=styles["Heading1"], spaceAfter=12)
         h2 = ParagraphStyle("BookH2", parent=styles["Heading2"], spaceAfter=10)
         body = ParagraphStyle("BookBody", parent=styles["BodyText"], leading=14, spaceAfter=8)
+        quote_style = ParagraphStyle("BookQuote", parent=body, leftIndent=18, rightIndent=8, italic=True)
+        callout_style = ParagraphStyle("BookCallout", parent=body, leftIndent=18, rightIndent=8, backColor="#f3f4f6")
+        placeholder_style = ParagraphStyle("BookPlaceholder", parent=body, italic=True, textColor="#555555")
+        code_style = ParagraphStyle(
+            "BookCode",
+            parent=styles["BodyText"],
+            fontName="Courier",
+            fontSize=9,
+            leading=11,
+            leftIndent=12,
+            rightIndent=6,
+            spaceAfter=8,
+        )
 
         story: List[Any] = []
         story.append(Spacer(1, 2 * inch))
@@ -470,13 +487,30 @@ class BookWorkflowService:
             story.append(Paragraph(self._escape(f"Chapter {ch['number']}"), h2))
             story.append(Paragraph(self._escape(ch["title"]), h1))
             story.append(Spacer(1, 0.1 * inch))
-            for block in self._split_blocks(ch["content"]):
-                if block.startswith("# "):
-                    story.append(Paragraph(self._escape(block[2:].strip()), h1))
-                elif block.startswith("## "):
-                    story.append(Paragraph(self._escape(block[3:].strip()), h2))
+            for block in self._iter_render_blocks(ch["content"]):
+                block_type = str(block.get("type", "paragraph"))
+                block_text = str(block.get("text", "")).strip()
+                if not block_text and block_type not in {"visual_placeholder"}:
+                    continue
+                if block_type == "h1":
+                    story.append(Paragraph(self._escape(block_text), h1))
+                elif block_type == "h2":
+                    story.append(Paragraph(self._escape(block_text), h2))
+                elif block_type == "code":
+                    story.append(Preformatted(block_text, code_style))
+                elif block_type == "quote":
+                    story.append(Paragraph(self._escape(block_text), quote_style))
+                elif block_type == "callout":
+                    label = str(block.get("label", "Note")).strip() or "Note"
+                    story.append(Paragraph(self._escape(f"{label}: {block_text}"), callout_style))
+                elif block_type == "visual_placeholder":
+                    kind = str(block.get("kind", "visual")).upper()
+                    label = str(block.get("label", "")).strip()
+                    story.append(Paragraph(self._escape(f"[{kind} PLACEHOLDER] {label}"), placeholder_style))
+                elif block_type == "table":
+                    story.append(Preformatted(block_text, code_style))
                 else:
-                    story.append(Paragraph(self._escape(block), body))
+                    story.append(Paragraph(self._escape(block_text), body))
             story.append(PageBreak())
 
         doc.build(story)
@@ -508,13 +542,37 @@ class BookWorkflowService:
 
         for ch in chapters:
             document.add_heading(f"Chapter {ch['number']}: {ch['title']}", level=1)
-            for block in self._split_blocks(ch["content"]):
-                if block.startswith("# "):
-                    document.add_heading(block[2:].strip(), level=1)
-                elif block.startswith("## "):
-                    document.add_heading(block[3:].strip(), level=2)
+            for block in self._iter_render_blocks(ch["content"]):
+                block_type = str(block.get("type", "paragraph"))
+                block_text = str(block.get("text", "")).strip()
+                if not block_text and block_type not in {"visual_placeholder"}:
+                    continue
+                if block_type == "h1":
+                    document.add_heading(block_text, level=1)
+                elif block_type == "h2":
+                    document.add_heading(block_text, level=2)
+                elif block_type == "code":
+                    p = document.add_paragraph()
+                    run = p.add_run(block_text)
+                    run.font.name = "Courier New"
+                    run.font.size = Pt(9)
+                elif block_type == "quote":
+                    p = document.add_paragraph()
+                    run = p.add_run(block_text)
+                    run.italic = True
+                elif block_type == "callout":
+                    p = document.add_paragraph()
+                    label = str(block.get("label", "Note")).strip() or "Note"
+                    run = p.add_run(f"{label}: {block_text}")
+                    run.italic = True
+                elif block_type == "visual_placeholder":
+                    kind = str(block.get("kind", "visual")).upper()
+                    label = str(block.get("label", "")).strip()
+                    p = document.add_paragraph()
+                    run = p.add_run(f"[{kind} PLACEHOLDER] {label}")
+                    run.italic = True
                 else:
-                    document.add_paragraph(block)
+                    document.add_paragraph(block_text)
             document.add_page_break()
 
         out = io.BytesIO()
@@ -528,6 +586,109 @@ class BookWorkflowService:
         norm = text.replace("\r\n", "\n").replace("\r", "\n")
         blocks = re.split(r"\n\s*\n", norm)
         return [b.strip() for b in blocks if b.strip()]
+
+    def _has_visual_placeholders(self, text: str) -> bool:
+        return bool(re.search(r"(?im)^\[(FIGURE|FLOWCHART)\s*:", str(text or "")))
+
+    def _iter_render_blocks(self, text: str) -> List[Dict[str, str]]:
+        norm = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not norm.strip():
+            return []
+
+        lines = norm.split("\n")
+        blocks: List[Dict[str, str]] = []
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
+            if not stripped:
+                i += 1
+                continue
+
+            if stripped.startswith("```"):
+                code_lines: List[str] = []
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    code_lines.append(lines[i])
+                    i += 1
+                if i < len(lines) and lines[i].strip().startswith("```"):
+                    i += 1
+                blocks.append({"type": "code", "text": "\n".join(code_lines).rstrip()})
+                continue
+
+            visual_match = re.match(r"^\[(FIGURE|FLOWCHART)\s*:\s*(.+?)\]\s*$", stripped, flags=re.IGNORECASE)
+            if visual_match:
+                blocks.append(
+                    {
+                        "type": "visual_placeholder",
+                        "kind": visual_match.group(1).strip().lower(),
+                        "label": visual_match.group(2).strip(),
+                        "text": "",
+                    }
+                )
+                i += 1
+                continue
+
+            if stripped.startswith(">"):
+                quote_lines: List[str] = []
+                callout_label = ""
+                while i < len(lines) and lines[i].strip().startswith(">"):
+                    raw_line = lines[i].strip()[1:].lstrip()
+                    callout_match = re.match(r"^\[\!([A-Z]+)\]\s*(.*)$", raw_line)
+                    if callout_match:
+                        callout_label = callout_match.group(1).title()
+                        raw_line = callout_match.group(2).strip()
+                    quote_lines.append(raw_line)
+                    i += 1
+                blocks.append(
+                    {
+                        "type": "callout" if callout_label else "quote",
+                        "label": callout_label,
+                        "text": "\n".join([line for line in quote_lines if line]).strip(),
+                    }
+                )
+                continue
+
+            if stripped.startswith("# "):
+                blocks.append({"type": "h1", "text": stripped[2:].strip()})
+                i += 1
+                continue
+            if stripped.startswith("## "):
+                blocks.append({"type": "h2", "text": stripped[3:].strip()})
+                i += 1
+                continue
+
+            if "|" in stripped:
+                table_lines: List[str] = []
+                start = i
+                while i < len(lines):
+                    probe = lines[i].strip()
+                    if not probe or "|" not in probe:
+                        break
+                    table_lines.append(probe)
+                    i += 1
+                table_text = "\n".join(table_lines).strip()
+                if len(table_lines) >= 2 and re.search(r"(?m)^\|?\s*:?-{2,}", table_text):
+                    blocks.append({"type": "table", "text": table_text})
+                    continue
+                i = start
+
+            paragraph_lines: List[str] = []
+            while i < len(lines):
+                probe = lines[i]
+                probe_stripped = probe.strip()
+                if not probe_stripped:
+                    break
+                if probe_stripped.startswith(("```", "# ", "## ", ">", "[")):
+                    break
+                paragraph_lines.append(probe_stripped)
+                i += 1
+            if paragraph_lines:
+                blocks.append({"type": "paragraph", "text": " ".join(paragraph_lines).strip()})
+            else:
+                i += 1
+
+        return blocks
 
     def _escape(self, value: str) -> str:
         return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

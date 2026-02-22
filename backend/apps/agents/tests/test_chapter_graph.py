@@ -344,3 +344,41 @@ class ChapterGraphTests(TestCase):
         self.assertIn("profile_compliance", review_meta)
         issues = review_meta.get("profile_compliance_issues", [])
         self.assertTrue(any("second-person voice" in str(issue).lower() for issue in issues))
+
+    @patch("apps.books.services.pipeline.VectorMemoryStore")
+    def test_word_guardrails_allow_flexible_length_by_chapter_complexity(self, _mock_store_cls):
+        self.project.metadata_json = {
+            "user_concept": {
+                "profile": {
+                    "chapterLength": "Short ~1500w",
+                }
+            }
+        }
+        self.project.save(update_fields=["metadata_json"])
+
+        orchestrator = AgentOrchestrator()
+        target = {
+            "number": 1,
+            "title": "Complex Chapter",
+            "bullet_points": [
+                "Concept setup",
+                "Core framework",
+                "Worked example",
+                "Counterexample",
+                "Common mistakes",
+                "Practice exercise",
+            ],
+        }
+        content = "# Complex Chapter\n\n## Section\n\n" + ("word " * 2100)
+
+        issues, word_count, minimum_word_count, guidance = orchestrator._review_guardrails(  # noqa: SLF001
+            self.project,
+            content,
+            target=target,
+        )
+
+        self.assertGreater(word_count, 2000)  # heading tokens are included by the simple split-based counter
+        self.assertLess(minimum_word_count, guidance["target"])
+        self.assertEqual(guidance["bullet_count"], 6)
+        self.assertFalse(any("below minimum" in issue.lower() for issue in issues))
+        self.assertFalse(any("far above expected range" in issue.lower() for issue in issues))

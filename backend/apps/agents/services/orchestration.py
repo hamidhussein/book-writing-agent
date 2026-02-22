@@ -14,11 +14,13 @@ from ..models import AgentRun, RunMode
 
 logger = logging.getLogger(__name__)
 
-_MIN_WORDS_BY_CHAPTER_LENGTH = {
-    "short": 900,
-    "medium": 1800,
-    "long": 3000,
-    "default": 1200,
+_CHAPTER_WORD_GUIDE_BY_LENGTH = {
+    # "hard_min" is a safety floor, not a target. "soft_*" defines a healthy
+    # range, and chapters may vary based on importance/complexity.
+    "short": {"target": 1500, "hard_min": 750, "soft_min": 1000, "soft_max": 2300, "hard_max": 3400},
+    "medium": {"target": 3000, "hard_min": 1400, "soft_min": 2200, "soft_max": 4300, "hard_max": 6200},
+    "long": {"target": 5000, "hard_min": 2400, "soft_min": 3600, "soft_max": 7200, "hard_max": 9800},
+    "default": {"target": 3000, "hard_min": 1200, "soft_min": 1800, "soft_max": 4200, "hard_max": 6000},
 }
 
 
@@ -444,7 +446,11 @@ class AgentOrchestrator:
         issues: List[str] = [str(i).strip() for i in existing_issues if str(i).strip()] if isinstance(existing_issues, list) else []
         critique = str(review.get("critique", "")).strip()
 
-        guardrail_issues, word_count, minimum_word_count = self._review_guardrails(project, content)
+        guardrail_issues, word_count, minimum_word_count, word_count_guidance = self._review_guardrails(
+            project,
+            content,
+            target=state.get("target", {}),
+        )
         profile_compliance = self._profile_compliance_guardrails(project, content)
         for issue in guardrail_issues:
             if issue not in issues:
@@ -468,6 +474,7 @@ class AgentOrchestrator:
         review["profile_compliance_issues"] = profile_compliance.get("issues", [])
         review["word_count"] = word_count
         review["minimum_word_count"] = minimum_word_count
+        review["word_count_guidance"] = word_count_guidance
         review["issues"] = issues
         review["critique"] = critique
 
@@ -707,10 +714,16 @@ class AgentOrchestrator:
         out["used_fallback"] = bool(fallback_stages)
         return out
 
-    def _review_guardrails(self, project: BookProject, content: str) -> tuple[List[str], int, int]:
+    def _review_guardrails(
+        self,
+        project: BookProject,
+        content: str,
+        target: Dict[str, Any] | None = None,
+    ) -> tuple[List[str], int, int, Dict[str, Any]]:
         text = str(content or "").strip()
         word_count = len([token for token in text.split() if token.strip()])
-        minimum_word_count = self._minimum_word_count_for_project(project)
+        word_count_guidance = self._chapter_word_guidance_for_project(project, target=target)
+        minimum_word_count = int(word_count_guidance.get("hard_min", 0))
         issues: List[str] = []
         if not text:
             issues.append("Chapter content is empty.")
@@ -718,7 +731,10 @@ class AgentOrchestrator:
             issues.append("Chapter is missing at least one '##' section heading.")
         if word_count < minimum_word_count:
             issues.append(f"Chapter word count {word_count} is below minimum {minimum_word_count}.")
-        return issues, word_count, minimum_word_count
+        hard_max = int(word_count_guidance.get("hard_max", 0) or 0)
+        if hard_max > 0 and word_count > hard_max:
+            issues.append(f"Chapter word count {word_count} is far above expected range for this chapter length ({hard_max} hard max).")
+        return issues, word_count, minimum_word_count, word_count_guidance
 
     def _profile_compliance_guardrails(self, project: BookProject, content: str) -> Dict[str, Any]:
         """
@@ -775,6 +791,13 @@ class AgentOrchestrator:
         }
 
     def _minimum_word_count_for_project(self, project: BookProject) -> int:
+        return int(self._chapter_word_guidance_for_project(project).get("hard_min", 1200))
+
+    def _chapter_word_guidance_for_project(
+        self,
+        project: BookProject,
+        target: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         profile = self._project_profile(project)
         chapter_length = str(profile.get("chapterLength", "")).strip().lower()
         key = "default"
@@ -784,7 +807,43 @@ class AgentOrchestrator:
             key = "medium"
         elif "long" in chapter_length:
             key = "long"
-        return _MIN_WORDS_BY_CHAPTER_LENGTH[key]
+
+        base = dict(_CHAPTER_WORD_GUIDE_BY_LENGTH[key])
+        bullet_points = []
+        if isinstance(target, dict):
+            raw_points = target.get("bullet_points", [])
+            if isinstance(raw_points, list):
+                bullet_points = [str(p).strip() for p in raw_points if str(p).strip()]
+
+        # Book-standard flexibility: anchor/complex chapters can be longer,
+        # bridge/simple chapters can be shorter. Use outline bullet count as a
+        # lightweight proxy for chapter importance/complexity.
+        bullet_count = len(bullet_points)
+        if bullet_count:
+            complexity_factor = max(0.8, min(1.35, 1.0 + (bullet_count - 4) * 0.08))
+        else:
+            complexity_factor = 1.0
+
+        def _scaled(value: int) -> int:
+            return int(round((value * complexity_factor) / 50.0) * 50)
+
+        guidance = {
+            "chapter_length_category": key,
+            "bullet_count": bullet_count,
+            "complexity_factor": round(complexity_factor, 2),
+            "target": _scaled(int(base["target"])),
+            "hard_min": _scaled(int(base["hard_min"])),
+            "soft_min": _scaled(int(base["soft_min"])),
+            "soft_max": _scaled(int(base["soft_max"])),
+            "hard_max": _scaled(int(base["hard_max"])),
+            "note": "Guidance is a flexible range based on chapter length and outline complexity, not an exact word target.",
+        }
+        # Safety: guarantee ordering after rounding.
+        guidance["hard_min"] = max(300, min(int(guidance["hard_min"]), int(guidance["soft_min"])))
+        guidance["soft_min"] = max(int(guidance["hard_min"]), min(int(guidance["soft_min"]), int(guidance["target"])))
+        guidance["soft_max"] = max(int(guidance["target"]), int(guidance["soft_max"]))
+        guidance["hard_max"] = max(int(guidance["soft_max"]), int(guidance["hard_max"]))
+        return guidance
 
     def _project_profile(self, project: BookProject) -> Dict[str, Any]:
         metadata = project.metadata_json if isinstance(project.metadata_json, dict) else {}

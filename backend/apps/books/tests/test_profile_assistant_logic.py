@@ -245,8 +245,235 @@ class ProfileAssistantLogicTests(SimpleTestCase):
         self.assertIn("reply 'finalize'", normalized["assistant_reply"].lower())
         self.assertNotIn("optional details", normalized["assistant_reply"].lower())
 
+    def test_keep_defaults_intent_finalizes_when_required_fields_complete(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "Basics of Agentic AI"
+        payload = {
+            "assistant_reply": "We have the core brief. Before finalizing, we can add optional details.",
+            "field_updates": {},
+            "next_field": "subtitle",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="keep default",
+            conversation=[{"role": "assistant", "content": "Optional details?"}],
+        )
+
+        self.assertTrue(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "")
+
+    def test_field_question_returns_explanation_and_keeps_form_context(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "AI Basics"
+        payload = {
+            "assistant_reply": "Would you like to finalize?",
+            "field_updates": {},
+            "next_field": "",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="what is front matter here?",
+            conversation=[],
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "frontMatter")
+        self.assertIn("pages before chapter 1", normalized["assistant_reply"].lower())
+
+    def test_add_more_details_advances_to_specific_optional_field_instead_of_looping(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "AI Basics"
+        long_conversation = [
+            {"role": "assistant", "content": "Hi"},
+            {"role": "user", "content": "AI Basics"},
+            {"role": "assistant", "content": "Who is it for?"},
+            {"role": "user", "content": "Beginners"},
+            {"role": "assistant", "content": "Purpose?"},
+            {"role": "user", "content": "Teach basics"},
+            {"role": "assistant", "content": "Tone?"},
+        ]
+        payload = {
+            "assistant_reply": "We have the core brief. Before finalizing, we can add a few optional details like subtitle or reader call-to-action and style/reference guidance.",
+            "field_updates": {},
+            "next_field": "",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="Add more details",
+            conversation=long_conversation,
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertIn(normalized["next_field"], {"customInstructions", "contentBoundaries", "booksToEmulate", "styleReferencePassage", "frontMatter", "backMatter", "richElements", "subtitle", "primaryCta"})
+        self.assertNotIn("we have the core brief", normalized["assistant_reply"].lower())
+
+    def test_required_field_sequence_overrides_optional_next_field_when_required_missing(self):
+        current_profile = _base_profile()
+        current_profile.update({"title": "", "genre": ""})
+        payload = {
+            "assistant_reply": "Would you like to add a subtitle?",
+            "field_updates": {},
+            "next_field": "subtitle",
+            "is_finalized": False,
+            "missing_required": ["title", "genre"],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="ok",
+            conversation=[],
+        )
+
+        self.assertIn(normalized["next_field"], {"title", "genre"})
+        self.assertNotEqual(normalized["next_field"], "subtitle")
+
     def test_normalize_profile_value_maps_vocabulary_and_tone_synonyms(self):
         self.assertEqual(_normalize_profile_value("vocabularyLevel", "basic"), "Simple")
         self.assertEqual(_normalize_profile_value("vocabularyLevel", "advanced"), "Technical")
         self.assertEqual(_normalize_profile_value("tone", "friendly"), "Conversational")
         self.assertEqual(_normalize_profile_value("tone", "educational"), "Informative")
+
+    def test_semantic_repair_moves_instructional_from_tone_to_writing_style(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "Time Management for Beginners"
+        payload = {
+            "assistant_reply": "Got it. What length are you aiming for?",
+            "field_updates": {"tone": "instructional"},
+            "next_field": "length",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="I want it to be instructional.",
+            conversation=[],
+        )
+
+        self.assertEqual(normalized["field_updates"].get("writingStyle"), "Instructional")
+        self.assertNotIn("tone", normalized["field_updates"])
+
+    def test_finalize_is_idempotent_after_recent_finalize(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "Time Management for Beginners"
+        payload = {
+            "assistant_reply": "We can add optional details before finalizing.",
+            "field_updates": {},
+            "next_field": "subtitle",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+        conversation = [
+            {"role": "assistant", "content": "All set! I've finalized the brief for Time Management for Beginners."},
+        ]
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="yes finalize",
+            conversation=conversation,
+        )
+
+        self.assertTrue(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "")
+        self.assertIn("already finalized", normalized["assistant_reply"].lower())
+
+    def test_off_topic_request_returns_scope_redirect(self):
+        current_profile = _base_profile()
+        payload = {
+            "assistant_reply": "What audience is this for?",
+            "field_updates": {},
+            "next_field": "audience",
+            "is_finalized": False,
+            "missing_required": ["title"],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="write a python code to print hello",
+            conversation=[],
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "")
+        self.assertIn("book studio assistant", normalized["assistant_reply"].lower())
+        self.assertIn("book brief", normalized["assistant_reply"].lower())
+
+    def test_pause_intent_returns_resume_later_reply(self):
+        current_profile = _base_profile()
+        payload = {
+            "assistant_reply": "Would you like to finalize?",
+            "field_updates": {},
+            "next_field": "",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="I need to rest now.",
+            conversation=[],
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "")
+        self.assertIn("rest", normalized["assistant_reply"].lower())
+        self.assertEqual(normalized["suggestions"], [])
+
+    def test_bare_field_label_is_treated_as_help_request(self):
+        current_profile = _base_profile()
+        current_profile["title"] = "Time Management for Beginners"
+        payload = {
+            "assistant_reply": "Would you like to finalize?",
+            "field_updates": {},
+            "next_field": "",
+            "is_finalized": False,
+            "missing_required": [],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="Primary CTA After Reading",
+            conversation=[],
+        )
+
+        self.assertFalse(normalized["is_finalized"])
+        self.assertEqual(normalized["next_field"], "primaryCta")
+        self.assertIn("action", normalized["assistant_reply"].lower())
+
+    def test_default_word_count_narration_is_rewritten(self):
+        current_profile = _base_profile()
+        payload = {
+            "assistant_reply": "You mentioned a word count of 3,000. How do you feel about shorter chapters?",
+            "field_updates": {},
+            "next_field": "chapterLength",
+            "is_finalized": False,
+            "missing_required": ["title"],
+        }
+
+        normalized = self.llm._normalize_assistant_payload(  # noqa: SLF001
+            payload=payload,
+            current_profile=current_profile,
+            user_message="I want it to be instructional",
+            conversation=[],
+        )
+
+        self.assertNotIn("you mentioned", normalized["assistant_reply"].lower())
+        self.assertIn("chapter", normalized["assistant_reply"].lower())

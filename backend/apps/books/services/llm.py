@@ -72,7 +72,23 @@ _CHAPTER_PLAN_SCHEMA = """{
       }
     ],
     "continuity_notes": ["<what must stay consistent with previous chapters>"],
-    "concept_alignment": "<how this chapter serves original user concept>"
+    "concept_alignment": "<how this chapter serves original user concept>",
+    "rich_elements_plan": [
+      {
+        "type": "<table | code_block | quote | callout | flowchart | figure | list>",
+        "section": "<which planned section should include it>",
+        "purpose": "<why it improves clarity/teaching>",
+        "required": <boolean>
+      }
+    ],
+    "visual_specs": [
+      {
+        "type": "<figure | flowchart>",
+        "placement_section": "<section heading where it appears>",
+        "caption": "<short caption for export>",
+        "prompt": "<visual generation prompt for DALL·E / image model or diagram renderer>"
+      }
+    ]
   }
 }"""
 
@@ -347,6 +363,7 @@ class LLMService:
         chapter_points = self._get_chapter_points(outline, chapter_number)
         memory_text = "\n".join(memory_context or [])
         knowledge_text = "\n\n".join(knowledge_context or [])
+        rich_elements_block = _rich_elements_preferences_block(project)
 
         system_prompt = _build_system_prompt(
             role=(
@@ -380,6 +397,7 @@ class LLMService:
             _profile_block(project),
             _section("Full Outline (for continuity)", json.dumps(outline, ensure_ascii=False, indent=2)),
             bullet_block,
+            rich_elements_block,
             _memory_block(memory_text),
             _knowledge_block(knowledge_text),
             _section("Writing Guidelines", _CHAPTER_GUIDELINES),
@@ -392,10 +410,19 @@ class LLMService:
             chapter.setdefault("title", chapter_title)
             if not chapter.get("summary"):
                 chapter["summary"] = self._summarize(chapter.get("content", ""))
+            payload = _augment_chapter_payload_rich_elements(
+                payload=payload,
+                project=project,
+                chapter_plan=None,
+            )
             return self._with_runtime_meta(payload, used_fallback=False)
 
         return self._with_runtime_meta(
-            self._fallback_chapter(project, outline, chapter_number),
+            _augment_chapter_payload_rich_elements(
+                payload=self._fallback_chapter(project, outline, chapter_number),
+                project=project,
+                chapter_plan=None,
+            ),
             used_fallback=True,
             fallback_stage="chapter_draft",
         )
@@ -412,6 +439,7 @@ class LLMService:
         chapter_points = self._get_chapter_points(outline, chapter_number)
         memory_text = "\n".join(memory_context or [])
         knowledge_text = "\n\n".join(knowledge_context or [])
+        rich_elements_block = _rich_elements_preferences_block(project)
 
         system_prompt = _build_system_prompt(
             role=(
@@ -420,7 +448,10 @@ class LLMService:
             ),
             task=(
                 f"Create a concrete writing plan for Chapter {chapter_number}: '{chapter_title}'. "
-                "Use the outline, prior memory, and knowledge context. Keep it precise and actionable."
+                "Use the outline, prior memory, and knowledge context. Keep it precise and actionable. "
+                "If the brief requests rich elements (tables, code, quotes, callouts, figures, flowcharts), "
+                "plan only the ones that genuinely improve this chapter. Do not force every selected element into every chapter. "
+                "For figure/flowchart ideas, add visual_specs with caption + generation prompt."
             ),
             schema=_CHAPTER_PLAN_SCHEMA,
         )
@@ -439,14 +470,17 @@ class LLMService:
             _profile_block(project),
             _section("Full Outline", json.dumps(outline, ensure_ascii=False, indent=2)),
             bullet_block,
+            rich_elements_block,
             _memory_block(memory_text),
             _knowledge_block(knowledge_text),
         )
 
         payload = self._call_json(system_prompt, user_prompt, model=self.fast_model, temperature=0.3)
         if payload and isinstance(payload.get("plan"), dict):
+            payload["plan"] = _normalize_chapter_plan_rich_elements(payload.get("plan", {}))
             return self._with_runtime_meta(payload, used_fallback=False)
 
+        requested_rich = _requested_rich_elements_from_project(project)
         return self._with_runtime_meta({
             "plan": {
                 "chapter_number": chapter_number,
@@ -455,6 +489,8 @@ class LLMService:
                 "sections": [{"heading": point[:80] or "Core Section", "purpose": "Expand this beat", "evidence_or_example": "Use a concrete example"} for point in (chapter_points or ["Core development"])],
                 "continuity_notes": ["Maintain tone and continuity with previous chapters."],
                 "concept_alignment": "Stay aligned to the original user concept and audience.",
+                "rich_elements_plan": _fallback_rich_elements_plan(chapter_points, requested_rich),
+                "visual_specs": _fallback_visual_specs_for_rich_elements(chapter_points, requested_rich),
             }
         }, used_fallback=True, fallback_stage="chapter_plan")
 
@@ -473,7 +509,9 @@ class LLMService:
         chapter_points = self._get_chapter_points(outline, chapter_number)
         memory_text = "\n".join(memory_context or [])
         knowledge_text = "\n\n".join(knowledge_context or [])
-        plan_text = json.dumps(chapter_plan or {}, ensure_ascii=False, indent=2)
+        normalized_plan = _normalize_chapter_plan_rich_elements(chapter_plan or {})
+        plan_text = json.dumps(normalized_plan, ensure_ascii=False, indent=2)
+        rich_elements_block = _rich_elements_preferences_block(project, chapter_plan=normalized_plan)
 
         system_prompt = _build_system_prompt(
             role=(
@@ -501,6 +539,7 @@ class LLMService:
             _section("Full Outline (for continuity)", json.dumps(outline, ensure_ascii=False, indent=2)),
             bullet_block,
             _section("Chapter Plan", plan_text),
+            rich_elements_block,
             _memory_block(memory_text),
             _knowledge_block(knowledge_text),
             _section("Revision Critique", critique),
@@ -515,6 +554,11 @@ class LLMService:
             chapter.setdefault("title", chapter_title)
             if not chapter.get("summary"):
                 chapter["summary"] = self._summarize(chapter.get("content", ""))
+            payload = _augment_chapter_payload_rich_elements(
+                payload=payload,
+                project=project,
+                chapter_plan=normalized_plan,
+            )
             return self._with_runtime_meta(payload, used_fallback=False)
         return self.generate_chapter(
             project,
@@ -612,6 +656,7 @@ class LLMService:
                 "Have a genuine conversation while building the book brief. "
                 "Infer multiple fields from a single message when clearly implied, "
                 "update only what you are confident about, and ask one natural follow-up question at a time. "
+                "Only ask about Concept Studio form fields (or explain those fields when the user asks what they mean). "
                 "Think step by step: (1) infer all confident details from the user's latest message, "
                 "(2) update those fields, (3) choose the single most useful missing detail to ask next, "
                 "(4) write a warm conversational reply that sounds human (not like a form), "
@@ -620,6 +665,8 @@ class LLMService:
                 "Treat current form values as context (some may be defaults) and avoid re-asking what is already clear. "
                 "Do not narrate default form values as if the user personally provided them. "
                 "If the user gives an age range for children/teens, fold that into audience (and beginner level if appropriate). "
+                "If the user asks something outside the book brief/form scope (general facts, coding help, etc.), politely redirect them back to the form. "
+                "After the brief is finalized, treat repeated finalize messages as confirmation only; do not restart optional loops unless the user asks to edit a field. "
                 "If required details are covered, you may offer a short optional-details batch before asking for finalize."
             ),
             schema=_PROFILE_ASSISTANT_SCHEMA,
@@ -652,6 +699,10 @@ class LLMService:
                     "Suggestions should directly answer your latest question, not propose workflow jumps.\n"
                     "Suggestions must be generic enough to stay useful regardless of topic (e.g. brainstorming, confirmation, preference statements).\n"
                     "Never guess the user's specific topic/content in suggestions.\n"
+                    "If the user asks what a form field means (e.g. front matter), explain it clearly before continuing.\n"
+                    "If the user sends only a form field label (e.g. 'Primary CTA After Reading'), treat it as a request for help on that field.\n"
+                    "Do not answer general coding/helpdesk/world-knowledge questions in this assistant; redirect to book brief fields.\n"
+                    "When required fields are complete and the user says keep defaults / happy with this / you decide, finalize.\n"
                     "If all required fields are present but the latest user message does not explicitly confirm finalize, "
                     "set is_finalized to false and ask for finalize confirmation."
                 ),
@@ -762,6 +813,7 @@ class LLMService:
             current_profile=current_profile,
             user_message=user_message,
         )
+        updates = _repair_semantic_assistant_updates(updates)
 
         merged = dict(current_profile)
         merged.update(updates)
@@ -792,14 +844,75 @@ class LLMService:
         next_field = next_field_raw if next_field_raw in _PROFILE_FIELD_ORDER else ""
         reply = str(payload.get("assistant_reply", "")).strip()
         finalize_intent = _is_finalize_intent(user_message)
+        defaults_acceptance_intent = _is_defaults_acceptance_intent(user_message)
+        wants_more_optional_details = _wants_more_optional_details(user_message)
+        explanation_field = _field_explanation_request_field(user_message)
+        field_label_reference = _field_label_reference_field(user_message)
+        pause_intent = _is_pause_or_rest_intent(user_message)
+        off_topic_intent = _is_off_topic_or_out_of_scope(user_message)
+        assistant_recently_finalized = _assistant_recently_finalized(conversation or [])
         
         # New logic: Don't hijack the reply or auto-finalize unless absolutely certain.
         # If the LLM explicitly said is_finalized, we respect it, but we still verify missing fields.
         llm_wants_finalize = bool(payload.get("is_finalized"))
 
+        if explanation_field or field_label_reference:
+            field_for_help = explanation_field or field_label_reference
+            is_finalized = False
+            if field_for_help in _PROFILE_FIELD_ORDER:
+                next_field = field_for_help
+            reply = _field_explanation_reply(field_for_help)
+            raw_suggestions = payload.get("suggestions", [])
+            suggestions = _normalize_assistant_suggestions(
+                raw_suggestions=raw_suggestions,
+                next_field=next_field,
+                profile=merged,
+                is_finalized=is_finalized,
+            )
+            suggestions = _filter_assistant_suggestions_for_context(
+                suggestions=suggestions,
+                next_field=next_field,
+                missing_required=missing_required,
+                profile=merged,
+            )
+            return {
+                "assistant_reply": reply,
+                "field_updates": updates,
+                "next_field": next_field,
+                "is_finalized": is_finalized,
+                "missing_required": missing_required,
+                "suggestions": suggestions,
+            }
+
+        if pause_intent:
+            return {
+                "assistant_reply": "Understood. Please rest. Your brief progress is saved, and you can come back later to continue or finalize.",
+                "field_updates": updates,
+                "next_field": "",
+                "is_finalized": False,
+                "missing_required": missing_required,
+                "suggestions": [],
+            }
+
+        if off_topic_intent:
+            return {
+                "assistant_reply": (
+                    "I’m the Book Studio assistant, so I can only help with your book brief here. "
+                    "If you want, tell me which form field you want to update (title, audience, tone, chapter length, etc.)."
+                ),
+                "field_updates": updates,
+                "next_field": "",
+                "is_finalized": False,
+                "missing_required": missing_required,
+                "suggestions": [],
+            }
+
         if missing_required:
             is_finalized = False
             if not next_field:
+                next_field = _next_missing_required_field(merged) or missing_required[0]
+            elif next_field not in _REQUIRED_PROFILE_FIELDS:
+                # Keep required-field sequencing intact until the brief is complete.
                 next_field = _next_missing_required_field(merged) or missing_required[0]
             elif next_field in updates and next_field not in missing_required:
                 # Move forward when the model captured a field this turn but forgot to advance.
@@ -817,7 +930,11 @@ class LLMService:
             # Else: Keep LLM's own chatty reply.
         else:
             # Profile is "complete" (fully filled, potentially by defaults)
-            if finalize_intent or llm_wants_finalize:
+            if assistant_recently_finalized and (finalize_intent or defaults_acceptance_intent):
+                is_finalized = True
+                next_field = ""
+                reply = "Your brief is already finalized. If you want changes, name a field to update and I’ll help."
+            elif finalize_intent or llm_wants_finalize or defaults_acceptance_intent:
                 is_finalized = True
                 next_field = ""
                 if not reply:
@@ -828,6 +945,18 @@ class LLMService:
                     next_field = ""
 
                 if optional_missing and allow_optional_batch:
+                    if wants_more_optional_details:
+                        next_field = _next_missing_optional_field(merged) or next_field or ""
+                        if next_field:
+                            reply = _question_for_field(next_field)
+                        elif not reply or _reply_claims_completion(reply):
+                            reply = _optional_batch_reply(optional_missing)
+                    elif _reply_stuck_in_optional_loop(reply):
+                        next_field = _next_missing_optional_field(merged) or next_field or ""
+                        if next_field:
+                            reply = _question_for_field(next_field)
+                        else:
+                            reply = _optional_batch_reply(optional_missing)
                     if not next_field:
                         next_field = _next_missing_optional_field(merged) or ""
                     if not reply or _reply_claims_completion(reply):
@@ -842,6 +971,12 @@ class LLMService:
                         or (optional_missing and not allow_optional_batch)
                     ):
                         reply = "I have captured all required details. If you agree, reply 'finalize' and I will apply them to the form."
+
+        if _reply_uses_default_word_count_as_user_fact(reply, current_profile):
+            if missing_required:
+                reply = _question_for_field(next_field)
+            elif not is_finalized:
+                reply = "We can choose the total word count explicitly. What target word count do you want for the full book?"
 
         raw_suggestions = payload.get("suggestions", [])
         suggestions = _normalize_assistant_suggestions(
@@ -870,7 +1005,47 @@ class LLMService:
         merged = dict(current_profile)
         missing_required = _missing_required_profile(merged)
         finalize_requested = _is_finalize_intent(user_message)
-        if finalize_requested and not missing_required:
+        defaults_acceptance = _is_defaults_acceptance_intent(user_message)
+        explanation_field = _field_explanation_request_field(user_message)
+        field_label_reference = _field_label_reference_field(user_message)
+        pause_intent = _is_pause_or_rest_intent(user_message)
+        off_topic_intent = _is_off_topic_or_out_of_scope(user_message)
+
+        if explanation_field or field_label_reference:
+            help_field = explanation_field or field_label_reference
+            return {
+                "assistant_reply": _field_explanation_reply(help_field),
+                "field_updates": {},
+                "next_field": help_field if help_field in _PROFILE_FIELD_ORDER else "",
+                "is_finalized": False,
+                "missing_required": missing_required,
+                "suggestions": _assistant_suggestion_fallback(help_field, merged),
+            }
+
+        if pause_intent:
+            return {
+                "assistant_reply": "Understood. Please rest. Your brief progress is saved, and you can continue later.",
+                "field_updates": {},
+                "next_field": "",
+                "is_finalized": False,
+                "missing_required": missing_required,
+                "suggestions": [],
+            }
+
+        if off_topic_intent:
+            return {
+                "assistant_reply": (
+                    "I’m the Book Studio assistant, so I can help with your Concept Studio form fields only. "
+                    "Tell me which field you want to update, and I’ll help."
+                ),
+                "field_updates": {},
+                "next_field": "",
+                "is_finalized": False,
+                "missing_required": missing_required,
+                "suggestions": [],
+            }
+
+        if (finalize_requested or defaults_acceptance) and not missing_required:
             return {
                 "assistant_reply": "Great. I have applied the brief to the form. Please review and generate when ready.",
                 "field_updates": {},
@@ -879,7 +1054,7 @@ class LLMService:
                 "missing_required": [],
                 "suggestions": [],
             }
-        if finalize_requested and missing_required:
+        if (finalize_requested or defaults_acceptance) and missing_required:
             next_field = _next_missing_required_field(merged) or missing_required[0]
             return {
                 "assistant_reply": f"Before finalizing, I still need one detail: {next_field}. {_question_for_field(next_field)}",
@@ -894,6 +1069,16 @@ class LLMService:
             optional_missing = _missing_optional_profile_fields(merged)
             next_optional = _next_missing_optional_field(merged) or ""
             if optional_missing:
+                if _wants_more_optional_details(user_message):
+                    next_optional = _next_missing_optional_field(merged) or ""
+                    return {
+                        "assistant_reply": _question_for_field(next_optional) if next_optional else _optional_batch_reply(optional_missing),
+                        "field_updates": {},
+                        "next_field": next_optional,
+                        "is_finalized": False,
+                        "missing_required": [],
+                        "suggestions": _assistant_suggestion_fallback(next_optional, merged),
+                    }
                 return {
                     "assistant_reply": _optional_batch_reply(optional_missing),
                     "field_updates": {},
@@ -1070,6 +1255,246 @@ def _project_profile_dict(project: BookProject) -> Dict[str, Any]:
     elif isinstance(raw_meta.get("profile"), dict):
         profile = raw_meta.get("profile", {})
     return profile if isinstance(profile, dict) else {}
+
+
+def _canonical_rich_element_type(value: Any) -> str:
+    text = _normalize_for_match(str(value or ""))
+    mapping = {
+        "tables": "table",
+        "table": "table",
+        "flowcharts": "flowchart",
+        "flowchart": "flowchart",
+        "figures diagrams": "figure",
+        "figure": "figure",
+        "figures": "figure",
+        "diagram": "figure",
+        "diagrams": "figure",
+        "callout boxes": "callout",
+        "callout box": "callout",
+        "callouts": "callout",
+        "callout": "callout",
+        "code blocks": "code_block",
+        "code block": "code_block",
+        "code": "code_block",
+        "quotes": "quote",
+        "quote": "quote",
+        "lists": "list",
+        "list": "list",
+    }
+    return mapping.get(text, "")
+
+
+def _requested_rich_elements_from_project(project: BookProject) -> List[str]:
+    profile = _project_profile_dict(project)
+    raw = profile.get("richElements", [])
+    items = raw if isinstance(raw, list) else []
+    out: List[str] = []
+    for item in items:
+        canonical = _canonical_rich_element_type(item)
+        if canonical and canonical not in out:
+            out.append(canonical)
+    return out
+
+
+def _normalize_chapter_plan_rich_elements(plan: Dict[str, Any] | Any) -> Dict[str, Any]:
+    out = dict(plan) if isinstance(plan, dict) else {}
+
+    normalized_rich_plan: List[Dict[str, Any]] = []
+    raw_rich_plan = out.get("rich_elements_plan", [])
+    if isinstance(raw_rich_plan, list):
+        for item in raw_rich_plan:
+            if not isinstance(item, dict):
+                continue
+            element_type = _canonical_rich_element_type(item.get("type"))
+            if not element_type:
+                continue
+            normalized_rich_plan.append(
+                {
+                    "type": element_type,
+                    "section": str(item.get("section", "")).strip(),
+                    "purpose": str(item.get("purpose", "")).strip(),
+                    "required": bool(item.get("required")),
+                }
+            )
+    out["rich_elements_plan"] = normalized_rich_plan
+
+    normalized_visual_specs: List[Dict[str, str]] = []
+    raw_visual_specs = out.get("visual_specs", [])
+    if isinstance(raw_visual_specs, list):
+        for item in raw_visual_specs:
+            if not isinstance(item, dict):
+                continue
+            visual_type = _canonical_rich_element_type(item.get("type"))
+            if visual_type not in {"figure", "flowchart"}:
+                continue
+            normalized_visual_specs.append(
+                {
+                    "type": visual_type,
+                    "placement_section": str(item.get("placement_section", "")).strip(),
+                    "caption": str(item.get("caption", "")).strip(),
+                    "prompt": str(item.get("prompt", "")).strip(),
+                }
+            )
+    out["visual_specs"] = normalized_visual_specs
+    return out
+
+
+def _fallback_rich_elements_plan(chapter_points: List[str], requested_rich: List[str]) -> List[Dict[str, Any]]:
+    if not requested_rich:
+        return []
+    section_hint = (chapter_points[0] if chapter_points else "Main development")[:120]
+    plans: List[Dict[str, Any]] = []
+    for element_type in requested_rich:
+        if element_type in {"figure", "flowchart", "list"}:
+            continue
+        plans.append(
+            {
+                "type": element_type,
+                "section": section_hint,
+                "purpose": "Improve clarity and teaching value for this chapter.",
+                "required": False,
+            }
+        )
+        if len(plans) >= 2:
+            break
+    return plans
+
+
+def _fallback_visual_specs_for_rich_elements(chapter_points: List[str], requested_rich: List[str]) -> List[Dict[str, str]]:
+    if "figure" not in requested_rich and "flowchart" not in requested_rich:
+        return []
+    point = (chapter_points[0] if chapter_points else "core concept")[:140]
+    specs: List[Dict[str, str]] = []
+    if "figure" in requested_rich:
+        specs.append(
+            {
+                "type": "figure",
+                "placement_section": point,
+                "caption": "Concept illustration",
+                "prompt": f"Educational clean diagram-style illustration explaining {point} for beginners.",
+            }
+        )
+    if "flowchart" in requested_rich:
+        specs.append(
+            {
+                "type": "flowchart",
+                "placement_section": point,
+                "caption": "Process flow",
+                "prompt": f"Flowchart showing the step-by-step process for {point} in a beginner-friendly way.",
+            }
+        )
+    return specs
+
+
+def _rich_elements_preferences_block(project: BookProject, chapter_plan: Dict[str, Any] | None = None) -> str:
+    requested = _requested_rich_elements_from_project(project)
+    if not requested:
+        return _section(
+            "Rich Elements",
+            "No specific rich elements were requested. Use standard prose unless a table, code block, quote, or callout clearly improves understanding.",
+        )
+
+    lines = [
+        f"Requested rich elements (use where relevant, not every chapter): {', '.join(requested)}.",
+        "Formatting contract for export parsing:",
+        "- code_block: fenced markdown with triple backticks",
+        "- quote: markdown blockquote lines starting with '>'",
+        "- callout: blockquote with marker like '> [!NOTE]' or '> [!TIP]'",
+        "- table: markdown table syntax",
+        "- figure placeholder: [FIGURE: short caption or placement note]",
+        "- flowchart placeholder: [FLOWCHART: short caption or process note]",
+        "- If a requested element is not useful in this chapter, omit it.",
+    ]
+
+    if isinstance(chapter_plan, dict):
+        rich_plan = chapter_plan.get("rich_elements_plan", [])
+        visual_specs = chapter_plan.get("visual_specs", [])
+        if isinstance(rich_plan, list) and rich_plan:
+            lines.append("Planned rich elements for this chapter:")
+            lines.append(json.dumps({"rich_elements_plan": rich_plan, "visual_specs": visual_specs or []}, ensure_ascii=False, indent=2))
+
+    return _section("Rich Elements Preferences", "\n".join(lines))
+
+
+def _extract_visual_placeholders(content: str) -> List[Dict[str, str]]:
+    placeholders: List[Dict[str, str]] = []
+    pattern = re.compile(r"^\[(FIGURE|FLOWCHART)\s*:\s*(.+?)\]\s*$", flags=re.IGNORECASE | re.MULTILINE)
+    for match in pattern.finditer(str(content or "")):
+        placeholders.append(
+            {
+                "type": match.group(1).strip().lower(),
+                "label": match.group(2).strip(),
+                "placeholder": match.group(0).strip(),
+            }
+        )
+    return placeholders
+
+
+def _detect_rich_elements_in_content(content: str) -> List[str]:
+    text = str(content or "")
+    normalized = text.lower()
+    used: List[str] = []
+
+    def add(name: str) -> None:
+        if name not in used:
+            used.append(name)
+
+    if "```" in text:
+        add("code_block")
+    if re.search(r"(?m)^\s*>\s+\S", text):
+        add("quote")
+    if re.search(r"(?m)^\s*>\s+\[\![A-Z]+\]", text):
+        add("callout")
+    if re.search(r"(?m)^\s*\|.+\|\s*$", text) and re.search(r"(?m)^\s*\|?\s*:?-{2,}", text):
+        add("table")
+    if re.search(r"(?m)^\s*[-*]\s+\S", text) or re.search(r"(?m)^\s*\d+\.\s+\S", text):
+        add("list")
+    if "[figure:" in normalized:
+        add("figure")
+    if "[flowchart:" in normalized:
+        add("flowchart")
+    return used
+
+
+def _augment_chapter_payload_rich_elements(
+    payload: Dict[str, Any] | Any,
+    project: BookProject,
+    chapter_plan: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    out = dict(payload) if isinstance(payload, dict) else {}
+    chapter = out.get("chapter", {})
+    if not isinstance(chapter, dict):
+        return out
+
+    content = str(chapter.get("content", "") or "")
+    requested = _requested_rich_elements_from_project(project)
+    used = _detect_rich_elements_in_content(content)
+    placeholders = _extract_visual_placeholders(content)
+    normalized_plan = _normalize_chapter_plan_rich_elements(chapter_plan or {})
+
+    metadata = out.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    rich_meta = metadata.get("rich_elements", {})
+    if not isinstance(rich_meta, dict):
+        rich_meta = {}
+
+    rich_meta["requested"] = requested
+    rich_meta["used"] = used
+    rich_meta["missing_requested"] = [element for element in requested if element not in used]
+    rich_meta["visual_placeholders"] = placeholders
+
+    rich_plan = normalized_plan.get("rich_elements_plan", []) if isinstance(normalized_plan, dict) else []
+    visual_specs = normalized_plan.get("visual_specs", []) if isinstance(normalized_plan, dict) else []
+    if isinstance(rich_plan, list) and rich_plan:
+        rich_meta["plan"] = rich_plan
+    if isinstance(visual_specs, list) and visual_specs:
+        rich_meta["visual_specs"] = visual_specs
+        rich_meta.setdefault("render_status", "placeholders_pending")
+
+    metadata["rich_elements"] = rich_meta
+    out["metadata"] = metadata
+    return out
 
 
 def _refine_non_negotiables_block(project: BookProject) -> str:
@@ -1263,6 +1688,38 @@ def _augment_assistant_updates_from_context(
     return enriched
 
 
+def _repair_semantic_assistant_updates(updates: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Correct common LLM field-assignment mistakes (e.g. "instructional" saved as tone).
+    """
+    repaired = dict(updates)
+    tone_value = str(repaired.get("tone", "")).strip()
+    style_value = str(repaired.get("writingStyle", "")).strip()
+
+    style_like_values = {"narrative", "analytical", "instructional", "lyrical", "journalistic"}
+    tone_like_values = {
+        "formal",
+        "conversational",
+        "inspirational",
+        "academic",
+        "humorous",
+        "dark",
+        "neutral",
+        "informative",
+    }
+
+    if tone_value and tone_value.lower() in style_like_values and not style_value:
+        repaired["writingStyle"] = tone_value.title() if tone_value.lower() != "instructional" else "Instructional"
+        repaired.pop("tone", None)
+
+    if style_value and style_value.lower() in tone_like_values and not tone_value:
+        normalized = style_value.lower()
+        repaired["tone"] = normalized.title() if normalized not in {"academic", "informative"} else ("Academic" if normalized == "academic" else "Informative")
+        repaired.pop("writingStyle", None)
+
+    return repaired
+
+
 def _extract_age_band(text: str) -> str:
     match = re.search(r"\b(\d{1,2})\s*(?:-|–|to)\s*(\d{1,2})\b", str(text or ""), flags=re.IGNORECASE)
     if not match:
@@ -1287,6 +1744,160 @@ def _is_finalize_intent(message: str) -> bool:
         return True
     if "agree" in text and ("final" in text or "confirm" in text):
         return True
+    return False
+
+
+def _is_defaults_acceptance_intent(message: str) -> bool:
+    text = _normalize_for_match(message)
+    if not text:
+        return False
+    if any(token in text for token in ("dont", "do not", "not yet", "later", "wait", "hold")):
+        return False
+    phrases = (
+        "keep default",
+        "keep defaults",
+        "use default",
+        "use defaults",
+        "you decide",
+        "set it yourself",
+        "set by yourself",
+        "add by yourself",
+        "add by your self",
+        "im happy with this",
+        "i am happy with this",
+        "looks good",
+        "sounds good",
+        "that is fine",
+        "thats fine",
+        "this is enough",
+        "good to go",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _wants_more_optional_details(message: str) -> bool:
+    text = _normalize_for_match(message)
+    if not text:
+        return False
+    phrases = (
+        "add more detail",
+        "add more details",
+        "more optional detail",
+        "more optional details",
+        "add optional details",
+        "i want to add more details",
+        "include more elements",
+        "add more optional details",
+    )
+    return any(phrase in text for phrase in phrases)
+
+
+def _is_pause_or_rest_intent(message: str) -> bool:
+    text = _normalize_for_match(message)
+    if not text:
+        return False
+    pause_phrases = (
+        "i am ill",
+        "im ill",
+        "i am sick",
+        "im sick",
+        "need to rest",
+        "i need to rest",
+        "need a break",
+        "i need a break",
+        "talk later",
+        "continue later",
+        "lets continue later",
+        "let s continue later",
+    )
+    return any(phrase in text for phrase in pause_phrases)
+
+
+def _assistant_recently_finalized(conversation: List[Dict[str, str]]) -> bool:
+    for turn in reversed(conversation[-12:]):
+        if not isinstance(turn, dict):
+            continue
+        if str(turn.get("role", "")).strip().lower() != "assistant":
+            continue
+        text = _normalize_for_match(str(turn.get("content", "")))
+        if not text:
+            continue
+        if any(
+            phrase in text
+            for phrase in (
+                "i have applied your brief to the form",
+                "your brief is all set",
+                "ive finalized the brief",
+                "i ve finalized the brief",
+                "all set ive finalized",
+                "all set i ve finalized",
+                "finalized the brief",
+            )
+        ):
+            return True
+    return False
+
+
+def _is_off_topic_or_out_of_scope(message: str) -> bool:
+    text = _normalize_for_match(message)
+    if not text:
+        return False
+
+    # Stay in-scope for book-brief and form-field terms.
+    in_scope_tokens = (
+        "book",
+        "title",
+        "subtitle",
+        "genre",
+        "audience",
+        "reader",
+        "purpose",
+        "tone",
+        "style",
+        "point of view",
+        "vocabulary",
+        "chapter",
+        "word count",
+        "publishing",
+        "front matter",
+        "back matter",
+        "cta",
+        "call to action",
+        "reference books",
+        "style reference",
+        "content boundaries",
+        "rich elements",
+        "finalize",
+        "finalise",
+        "brief",
+    )
+    if any(token in text for token in in_scope_tokens):
+        return False
+
+    code_tokens = (
+        "python code",
+        "write code",
+        "code to ",
+        "print helo",
+        "print hello",
+        "javascript",
+        "sql query",
+        "html code",
+    )
+    fact_tokens = (
+        "pm of",
+        "prime minister",
+        "president of",
+        "capital of",
+        "who is ",
+        "weather ",
+        "news ",
+    )
+    if any(token in text for token in code_tokens):
+        return True
+    if any(token in text for token in fact_tokens):
+        return True
+
     return False
 
 
@@ -1515,6 +2126,32 @@ def _reply_claims_completion(reply: str) -> bool:
     return any(signal in text for signal in completion_signals)
 
 
+def _reply_stuck_in_optional_loop(reply: str) -> bool:
+    text = _normalize_for_match(reply)
+    if not text:
+        return False
+    return (
+        "we have the core brief" in text
+        and "optional details" in text
+        and ("keep the defaults" in text or "finalize" in text)
+    )
+
+
+def _reply_uses_default_word_count_as_user_fact(reply: str, current_profile: Dict[str, Any]) -> bool:
+    text = _normalize_for_match(reply)
+    if not text:
+        return False
+    if "you mentioned" not in text and "you said" not in text:
+        return False
+    try:
+        length = int(current_profile.get("length", 0))
+    except Exception:
+        return False
+    if length != _PROFILE_FORM_DEFAULTS.get("length"):
+        return False
+    return ("word count" in text or "3000" in text or "3 000" in text)
+
+
 def _ordered_unique_fields(fields: List[str]) -> List[str]:
     seen = set()
     ordered: List[str] = []
@@ -1728,6 +2365,101 @@ def _assistant_suggestion_fallback(next_field: str, profile: Dict[str, Any]) -> 
     return ["Tell me more", "Suggest options", "Use sensible defaults"]
 
 
+def _field_aliases() -> tuple[tuple[str, tuple[str, ...]], ...]:
+    return (
+        ("frontMatter", ("front matter", "frontmatter")),
+        ("backMatter", ("back matter", "backmatter")),
+        ("primaryCta", ("primary cta", "primary cta after reading", "cta", "call to action")),
+        ("booksToEmulate", ("reference books", "books to emulate")),
+        ("styleReferencePassage", ("style reference passage", "style reference", "reference passage")),
+        ("customInstructions", ("topics skills", "topics / skills", "topics and skills", "custom instructions")),
+        ("contentBoundaries", ("content boundaries", "content boundaries optional", "boundaries")),
+        ("chapterLength", ("chapter length",)),
+        ("pageFeel", ("page feel",)),
+        ("publishingIntent", ("publishing intent",)),
+        ("audienceKnowledgeLevel", ("knowledge level", "audience knowledge level")),
+        ("richElements", ("rich elements", "elements", "visual elements")),
+    )
+
+
+def _field_label_reference_field(message: str) -> str:
+    text = _normalize_for_match(message)
+    if not text:
+        return ""
+    # Used when users tap/paste a field label directly (without asking a full question).
+    if len(text.split()) > 6:
+        return ""
+    for field, patterns in _field_aliases():
+        for pattern in patterns:
+            if text == pattern:
+                return field
+    return ""
+
+
+def _field_explanation_request_field(message: str) -> str:
+    text = _normalize_for_match(message)
+    if not text:
+        return ""
+    if not any(token in text for token in ("what is", "what s", "means", "meaning", "explain", "define")):
+        return ""
+
+    for field, patterns in _field_aliases():
+        for pattern in patterns:
+            if pattern in text:
+                return field
+    return ""
+
+
+def _field_explanation_reply(field: str) -> str:
+    explanations = {
+        "frontMatter": (
+            "Front matter means the pages before Chapter 1, like a foreword, preface, or introduction. "
+            "It sets context for the reader before the main content starts. "
+            "Would you like to include just an Introduction, or add a Preface/Foreword too?"
+        ),
+        "backMatter": (
+            "Back matter means the pages after the main chapters, such as a glossary, appendix, bibliography, or about the author. "
+            "These help readers review terms, references, and extras. "
+            "Would you like to choose any of those?"
+        ),
+        "primaryCta": (
+            "Primary CTA means the main action you want readers to take after finishing the book, such as applying a method, trying an exercise, or using your framework. "
+            "If you do not need one, we can leave it blank."
+        ),
+        "booksToEmulate": (
+            "Reference Books means books whose structure or style you want the AI to learn from. "
+            "Adding titles with author names gives a stronger style signal."
+        ),
+        "styleReferencePassage": (
+            "Style Reference Passage is a short paragraph in the voice you want. "
+            "It is one of the strongest style signals you can provide for tone and sentence flow."
+        ),
+        "customInstructions": (
+            "Topics / Skills is where you list what the book should cover or teach, plus any must-have elements like examples, analogies, or code snippets."
+        ),
+        "contentBoundaries": (
+            "Content Boundaries are limits the AI should respect, such as topics to avoid, unsafe content, or claims you do not want included."
+        ),
+        "chapterLength": (
+            "Chapter Length controls how long each chapter should feel (short, medium, or long). "
+            "Together with total word count, it affects the estimated number of chapters."
+        ),
+        "pageFeel": (
+            "Page Feel is the overall reading depth and density, like a quick guide versus a comprehensive reference."
+        ),
+        "publishingIntent": (
+            "Publishing Intent means how you plan to use the book, such as self-publishing, traditional publishing, corporate/internal use, or academic use."
+        ),
+        "audienceKnowledgeLevel": (
+            "Audience Knowledge Level is how much your readers already know before starting, such as complete beginner, intermediate, or expert."
+        ),
+        "richElements": (
+            "Rich Elements are extra content formats inside chapters, like tables, diagrams, callout boxes, code blocks, quotes, or lists."
+        ),
+    }
+    return explanations.get(field, "That field controls how the book is generated. I can explain it and help you choose a good value.")
+
+
 def _question_for_field(field: str) -> str:
     prompts = {
         "title": "What is your book title or working title?",
@@ -1745,6 +2477,7 @@ def _question_for_field(field: str) -> str:
         "tone": "Which tone should we use?",
         "writingStyle": "Which writing style should lead this book?",
         "pointOfView": "What point of view do you prefer?",
+        "tense": "Which tense should the writing use: present, past, or timeless/as appropriate?",
         "sentenceRhythm": "Should sentence rhythm be short, long-flowing, or mixed?",
         "vocabularyLevel": "What vocabulary level should we maintain?",
         "ghostwritingMode": "Should ghostwriting mode be ON (author voice from personal experience)?",
@@ -1809,6 +2542,11 @@ _CHAPTER_GUIDELINES = (
     "- Use # for the chapter title and ## for section headings inside the content field.\n"
     "- Open with a hook — a scene, question, or provocation — before any exposition.\n"
     "- Each ## section should correspond to one bullet point from the outline.\n"
+    "- Chapter length is a guideline, not an exact word target: let chapter importance, complexity, and examples determine depth.\n"
+    "- It is normal for some chapters to be shorter bridge chapters and others to be longer anchor chapters.\n"
+    "- If the brief requests rich elements, use them only where they genuinely improve clarity or instruction.\n"
+    "- Use fenced markdown for code blocks, markdown tables for tables, and blockquotes for quotes/callouts.\n"
+    "- Use placeholders like [FIGURE: ...] or [FLOWCHART: ...] for visuals so export can place generated assets later.\n"
     "- The closing paragraph must create forward momentum: a question, a reveal, or a consequence.\n"
     "- The summary field is for editorial use: capture the chapter's function in the book, not just its content."
 )

@@ -508,6 +508,11 @@ const ASSISTANT_FIELD_LABELS: Record<string, string> = {
   tense: 'Tense',
   customInstructions: 'Topics / Skills',
   booksToEmulate: 'Reference Books',
+  styleReferencePassage: 'Style Reference Passage',
+  frontMatter: 'Front Matter',
+  backMatter: 'Back Matter',
+  richElements: 'Rich Elements',
+  contentBoundaries: 'Content Boundaries',
 };
 
 const quickChoice = (label: string, message?: string): AssistantQuickChoice => ({
@@ -1219,6 +1224,7 @@ const ConceptStep: React.FC<{
   const [kbPriority, setKbPriority] = useState<SourcePriority>('supporting');
   const [knowledgeSummary, setKnowledgeSummary] = useState('No knowledge source uploaded yet.');
   const [setupStep, setSetupStep] = useState(1);
+  const [wordCountInput, setWordCountInput] = useState(() => String(Math.max(300, Number(bookState.length) || 300)));
   const [assistantBusy, setAssistantBusy] = useState(false);
   const [assistantInput, setAssistantInput] = useState('');
   const [assistantCheckedChoices, setAssistantCheckedChoices] = useState<string[]>([]);
@@ -1314,10 +1320,37 @@ const ConceptStep: React.FC<{
   const assistantFocusLabel = assistantUsesCheckboxChoices
     ? (ASSISTANT_FIELD_LABELS[assistantFocusField] || 'Selections')
     : 'Quick Replies';
-  const toAssistantFieldLabel = (field: string) => ASSISTANT_FIELD_LABELS[field] || PROFILE_LABELS[field] || field;
+  const humanizeAssistantFieldKey = (field: string) =>
+    field
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/^./, (c) => c.toUpperCase());
+  const toAssistantFieldLabel = (field: string) =>
+    ASSISTANT_FIELD_LABELS[field] || PROFILE_LABELS[field] || humanizeAssistantFieldKey(field);
   const pendingAssistantFieldLabels = Object.keys(assistantDraft)
     .filter((field) => field.trim().length > 0)
     .map(toAssistantFieldLabel);
+  const pendingAssistantFieldPreviews = Object.entries(assistantDraft)
+    .filter(([field]) => field.trim().length > 0)
+    .map(([field, value]) => {
+      let preview = '';
+      if (Array.isArray(value)) {
+        preview = value.map((item) => String(item).trim()).filter(Boolean).join(', ');
+      } else if (typeof value === 'boolean') {
+        preview = value ? 'Yes' : 'No';
+      } else if (typeof value === 'number') {
+        preview = Number.isFinite(value) ? value.toLocaleString() : String(value);
+      } else if (typeof value === 'string') {
+        preview = value.trim();
+      } else if (value !== null && value !== undefined) {
+        preview = String(value);
+      }
+      const trimmedPreview = preview.trim();
+      return {
+        field,
+        label: toAssistantFieldLabel(field),
+        preview: trimmedPreview.length > 84 ? `${trimmedPreview.slice(0, 84)}...` : trimmedPreview,
+      };
+    });
   const appliedAssistantFieldLabels = assistantLastAppliedFields
     .filter((field) => field.trim().length > 0)
     .map(toAssistantFieldLabel);
@@ -1352,6 +1385,11 @@ const ConceptStep: React.FC<{
     }
     assistantViewportRef.current.scrollTop = assistantViewportRef.current.scrollHeight;
   }, [assistantMessages, assistantBusy]);
+
+  useEffect(() => {
+    const normalized = String(Math.max(300, Number(bookState.length) || 300));
+    setWordCountInput((prev) => (prev === normalized ? prev : normalized));
+  }, [bookState.length]);
 
   useEffect(() => {
     setAssistantCheckedChoices([]);
@@ -1491,6 +1529,29 @@ const ConceptStep: React.FC<{
     setAssistantCheckedChoices([]);
   };
 
+  const handleWordCountChange = (raw: string) => {
+    if (!/^\d*$/.test(raw)) {
+      return;
+    }
+    setWordCountInput(raw);
+    if (!raw.trim()) {
+      return;
+    }
+    const parsed = parseInt(raw, 10);
+    if (Number.isFinite(parsed) && parsed >= 300) {
+      save('length', parsed);
+    }
+  };
+
+  const commitWordCountInput = () => {
+    const parsed = parseInt(wordCountInput, 10);
+    const normalized = Number.isFinite(parsed) ? Math.max(300, parsed) : Math.max(300, Number(bookState.length) || 300);
+    setWordCountInput(String(normalized));
+    if (bookState.length !== normalized) {
+      save('length', normalized);
+    }
+  };
+
   const saveKnowledgeText = async () => {
     if (!bookState.title.trim()) {
       toast.error('Set a book title first.');
@@ -1599,7 +1660,22 @@ const ConceptStep: React.FC<{
           <InputGroup label="Subtitle (Optional)" value={bookState.subtitle} onChange={(v) => save('subtitle', v)} placeholder="A practical guide to deep work" />
           <SelectGroup label="Genre" value={bookState.genre} onChange={(v) => save('genre', v)} options={GENRE_OPTIONS} />
           <SelectGroup label="Language" value={bookState.language} onChange={(v) => save('language', v)} options={LANGUAGE_OPTIONS} />
-          <InputGroup label="Target Word Count" type="number" value={bookState.length} onChange={(v) => save('length', Math.max(300, parseInt(v, 10) || 300))} />
+          <div>
+            <InputGroup
+              label="Target Word Count"
+              type="number"
+              value={wordCountInput}
+              onChange={handleWordCountChange}
+              onBlur={commitWordCountInput}
+              min={300}
+              step={500}
+              inputMode="numeric"
+              placeholder="e.g. 4000 or 30000"
+            />
+            <p className="mt-1.5 text-xs text-slate-500">
+              Type any value directly (for example `4000`, `5000`, `30000`). Minimum is 300 words.
+            </p>
+          </div>
           <SelectGroup label="Page Feel" value={bookState.pageFeel} onChange={(v) => save('pageFeel', v)} options={PAGE_FEEL_OPTIONS} />
           <div className="md:col-span-2">
             <SelectGroup label="Publishing Intent" value={bookState.publishingIntent} onChange={(v) => save('publishingIntent', v)} options={PUBLISHING_INTENT_OPTIONS} />
@@ -1914,7 +1990,8 @@ const ConceptStep: React.FC<{
                 <div className="rounded-lg border border-slate-200 bg-white p-2.5 shadow-sm">
                   <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Pending Capture</div>
                   {pendingAssistantFieldLabels.length > 0 ? (
-                    <div className="flex flex-wrap gap-1.5">
+                    <div>
+                      <div className="flex flex-wrap gap-1.5">
                       {pendingAssistantFieldLabels.slice(0, 5).map((label) => (
                         <span key={`pending-${label}`} className="rounded-md bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
                           {label}
@@ -1925,6 +2002,17 @@ const ConceptStep: React.FC<{
                           +{pendingAssistantFieldLabels.length - 5} more
                         </span>
                       ) : null}
+                    </div>
+                      {pendingAssistantFieldPreviews.length > 0 && (
+                        <div className="mt-2 space-y-1">
+                          {pendingAssistantFieldPreviews.slice(0, 3).map((item) => (
+                            <div key={`pending-preview-${item.field}`} className="text-[11px] leading-relaxed text-slate-600">
+                              <span className="font-semibold text-slate-700">{item.label}:</span>{' '}
+                              {item.preview || 'Captured'}
+                            </div>
+                          ))}
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="text-xs text-slate-500">No pending captured values.</div>
@@ -1955,7 +2043,7 @@ const ConceptStep: React.FC<{
             {assistantReadyToFinalize && (
               <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-2.5">
                 <div className="text-xs font-medium text-emerald-700">
-                  Ready to apply captured values to the form.
+                  Ready to apply captured values. Remaining optional fields can stay at defaults.
                 </div>
                 <button
                   type="button"
@@ -2488,14 +2576,28 @@ const ExportStep: React.FC<{
   );
 };
 
-const InputGroup: React.FC<{ label: string; value: string | number; onChange: (v: string) => void; type?: 'text' | 'number'; placeholder?: string }> = ({ label, value, onChange, type = 'text', placeholder }) => (
+const InputGroup: React.FC<{
+  label: string;
+  value: string | number;
+  onChange: (v: string) => void;
+  type?: 'text' | 'number';
+  placeholder?: string;
+  onBlur?: () => void;
+  min?: number;
+  step?: number;
+  inputMode?: React.HTMLAttributes<HTMLInputElement>['inputMode'];
+}> = ({ label, value, onChange, type = 'text', placeholder, onBlur, min, step, inputMode }) => (
   <div className="space-y-1.5">
     <label className="block text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</label>
     <input
       type={type}
       value={value}
       onChange={(e) => onChange(e.target.value)}
+      onBlur={onBlur}
       placeholder={placeholder}
+      min={min}
+      step={step}
+      inputMode={inputMode}
       className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm outline-none transition-colors focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500"
     />
   </div>
